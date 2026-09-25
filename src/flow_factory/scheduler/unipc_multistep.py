@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
+
 from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 from diffusers.utils.outputs import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
@@ -27,7 +28,6 @@ from ..utils.base import to_broadcast_tensor
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import flow_match_sigma
 from .abc import SDESchedulerMixin, SDESchedulerOutput, stable_mean_except_batch
-from .time_shift import FlowSamplingTimeShiftMixin
 
 logger = setup_logger(__name__)
 
@@ -37,9 +37,7 @@ class UniPCMultistepSDESchedulerOutput(SDESchedulerOutput):
     pass
 
 
-class UniPCMultistepSDEScheduler(
-    FlowSamplingTimeShiftMixin, UniPCMultistepScheduler, SDESchedulerMixin
-):
+class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
     """
     UniPC scheduler with SDE sampling support for RL fine-tuning.
 
@@ -78,24 +76,6 @@ class UniPCMultistepSDEScheduler(
         self.seed = seed
         self.dynamics_type = dynamics_type
         self._is_eval = False
-
-    def set_timesteps(
-        self,
-        num_inference_steps: Optional[int] = None,
-        device: Optional[Union[str, torch.device]] = None,
-        sigmas: Optional[List[float]] = None,
-        mu: Optional[float] = None,
-    ) -> None:
-        """Build the upstream schedule and retain its actual flow-shift parameters.
-
-        Args:
-            num_inference_steps: Number of generated transitions.
-            device: Device for scheduler tensors.
-            sigmas: Optional pre-shift noise grid.
-            mu: Dynamic shift passed by the generation adapter.
-        """
-        super().set_timesteps(num_inference_steps, device=device, sigmas=sigmas, mu=mu)
-        self._record_sampling_time_shift(static_shift=self.config.flow_shift, mu=mu)
 
     @property
     def is_eval(self):

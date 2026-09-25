@@ -36,6 +36,7 @@ from flow_factory.models.stable_diffusion.sd3_5 import SD3_5Adapter, SD3_5Sample
 from flow_factory.samples import ComponentTrajectory, StructuredTrajectory
 from flow_factory.scheduler import FlowMatchEulerDiscreteSDEScheduler, SchedulerGroup
 from flow_factory.trainers.distillation.tdm import TDMTrainer
+from flow_factory.trainers.distillation.tdm_time_sampling import capture_generation_shift
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
     RoleOptimizationCoordinator,
@@ -193,7 +194,8 @@ def rollout(trainer, kind):
         batch["img_ids"] = torch.zeros(4, 3, device=device)
         x = torch.randn(1, 4, 4, device=device)
         sample_cls = Flux1Sample
-    adapter.scheduler.set_timesteps(sigmas=[1.0, 0.75, 0.5, 0.25], device=device)
+    with capture_generation_shift(adapter.scheduler) as shifts:
+        adapter.scheduler.set_timesteps(sigmas=[1.0, 0.75, 0.5, 0.25], device=device)
     sigmas = adapter.scheduler.sigmas
     states = [x[0]]
     with adapter.use_component_variant("generator"):
@@ -213,7 +215,7 @@ def rollout(trainer, kind):
     fields = {name: value if name == "img_ids" else value[0] for name, value in batch.items()}
     return sample_cls(
         **fields,
-        extra_kwargs={"_tdm_sampling_shift": adapter.scheduler.sampling_time_shift},
+        extra_kwargs={"_tdm_sampling_shift": shifts[0]},
         trajectory=StructuredTrajectory(
             components={
                 "latent": ComponentTrajectory(

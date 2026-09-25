@@ -65,6 +65,7 @@ from .distribution_matching import (
     tdm_generator_loss,
 )
 from .dmd2 import DMD2Trainer
+from .tdm_time_sampling import capture_generation_shift
 from .tdm_trajectory import TDMBoundaryUnit, TDMTrajectoryRuntimeMixin
 
 
@@ -122,18 +123,13 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         Returns:
             Samples carrying the effective primary shift for pre-shift uniform replay.
         """
-        samples = super().sample_batch(batch, reward_buffer=reward_buffer, **kwargs)
-        if self.training_args.tdm_timestep_sampling == "pre_shift_uniform":
-            primary = self.adapter.trajectory_component_order[0]
-            scheduler = self.adapter.scheduler_group[primary]
-            if not hasattr(type(scheduler), "sampling_time_shift"):
-                raise ValueError(
-                    "pre_shift_uniform requires a scheduler exposing sampling_time_shift; "
-                    f"received {type(scheduler).__name__}"
-                )
-            shift = scheduler.sampling_time_shift
-            for sample in samples:
-                sample.extra_kwargs["_tdm_sampling_shift"] = shift
+        if self.training_args.tdm_timestep_sampling != "pre_shift_uniform":
+            return super().sample_batch(batch, reward_buffer=reward_buffer, **kwargs)
+        primary = self.adapter.trajectory_component_order[0]
+        with capture_generation_shift(self.adapter.scheduler_group[primary]) as shifts:
+            samples = super().sample_batch(batch, reward_buffer=reward_buffer, **kwargs)
+        for sample in samples:
+            sample.extra_kwargs["_tdm_sampling_shift"] = shifts[0]
         return samples
 
     def _optimizer_args_for_role(self, role_name: str):

@@ -178,15 +178,17 @@ def test_snapshot_keeps_each_rollout_shift_after_scheduler_changes(monkeypatch, 
     )
     trainer.adapter.scheduler_group["video"] = scheduler
 
+    generation_shifts = iter((3, 7))
+
     def generate(*args, **kwargs):
+        shift = next(generation_shifts)
+        if not dynamic:
+            scheduler.set_shift(shift)
+        scheduler.set_timesteps(sigmas=[1, 0.5], mu=math.log(shift) if dynamic else None)
         return [_sample()]
 
     monkeypatch.setattr(BaseTrainer, "sample_batch", generate)
-    scheduler.set_timesteps(sigmas=[1, 0.5], mu=math.log(3) if dynamic else None)
     first = trainer.sample_batch({})
-    if not dynamic:
-        scheduler.set_shift(7)
-    scheduler.set_timesteps(sigmas=[1, 0.5], mu=math.log(7) if dynamic else None)
     second = trainer.sample_batch({})
     assert "_tdm_sampling_shift" not in trainer._stack_replay_unit(first)
     first_units = trainer._build_boundary_units(first)
@@ -372,3 +374,20 @@ def test_reverse_h3_uses_mapped_cap_and_preserves_replay(monkeypatch, strategy):
         for name in adapter.trajectory_component_order:
             assert bool((times.sigma[name] > unit.mid_times.sigma[name]).all())
             assert bool((times.sigma[name] < cap.sigma[name]).all())
+
+
+def test_logit_normal_generation_does_not_wrap_scheduler(monkeypatch):
+    trainer = _trainer()
+    samples = [_sample()]
+    received = []
+
+    def generate(self, batch, reward_buffer=None, **kwargs):
+        received.append((batch, reward_buffer, kwargs))
+        return samples
+
+    monkeypatch.setattr(BaseTrainer, "sample_batch", generate)
+    # This scheduler fake has no set_timesteps method: no capture should be attempted.
+    batch, reward_buffer = {}, object()
+    assert trainer.sample_batch(batch, reward_buffer=reward_buffer, example=True) is samples
+    assert received == [(batch, reward_buffer, {"example": True})]
+    assert "_tdm_sampling_shift" not in samples[0].extra_kwargs

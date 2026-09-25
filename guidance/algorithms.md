@@ -577,10 +577,12 @@ Score-query times use `train.tdm_timestep_sampling` (also inherited by TDM-R1):
 
 There is no independent `tdm_time_shift` parameter. Generation captures the effective
 scheduler shift on each rollout batch, including dynamic exponential (`gamma=exp(mu)`)
-and linear (`gamma=mu`) shifts. TDM snapshots it per sample before another batch or
-an evaluation can change scheduler state. FlowMatchEuler, flow-sigma UniPC, and MiniMax H3
-expose this contract. Custom schedulers must expose `sampling_time_shift`; additional
-terminal stretching, sigma inversion, or Karras/exponential/beta grid conversions are
+and linear (`gamma=mu`) shifts. TDM captures the primary scheduler's `set_timesteps()`
+arguments during generation and snapshots the effective shift per sample before another batch or evaluation can change it.
+The temporary wrapper preserves the method signature and is restored even on failure.
+FlowMatchEuler, flow-sigma UniPC, and MiniMax H3 are supported. Missing schedule calls or
+different effective shifts within one rollout raise an error. Additional terminal
+stretching, sigma inversion, or Karras/exponential/beta grid conversions are
 rejected by `pre_shift_uniform` because they are not a pure flow shift.
 
 For K=4 and shift=3, the actual boundaries are `1000 -> 900 -> 750 -> 500 -> 0`.

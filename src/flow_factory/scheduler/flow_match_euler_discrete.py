@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
+
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -33,7 +34,6 @@ from ..utils.base import to_broadcast_tensor
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import flow_match_sigma
 from .abc import SDESchedulerMixin, SDESchedulerOutput, stable_mean_except_batch
-from .time_shift import FlowSamplingTimeShiftMixin
 
 logger = setup_logger(__name__)
 
@@ -93,9 +93,7 @@ class FlowMatchEulerDiscreteSDESchedulerOutput(SDESchedulerOutput):
     pass
 
 
-class FlowMatchEulerDiscreteSDEScheduler(
-    FlowSamplingTimeShiftMixin, FlowMatchEulerDiscreteScheduler, SDESchedulerMixin
-):
+class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESchedulerMixin):
     """
     A scheduler with noise level provided within the given steps
     """
@@ -121,32 +119,6 @@ class FlowMatchEulerDiscreteSDEScheduler(
         self.seed = seed
         self.dynamics_type = dynamics_type
         self._is_eval = False
-
-    def set_timesteps(
-        self,
-        num_inference_steps: Optional[int] = None,
-        device: Optional[Union[str, torch.device]] = None,
-        sigmas: Optional[List[float]] = None,
-        mu: Optional[float] = None,
-        timesteps: Optional[List[float]] = None,
-    ) -> None:
-        """Build the upstream schedule and retain its actual flow-shift parameters.
-
-        Args:
-            num_inference_steps: Number of generated transitions.
-            device: Device for scheduler tensors.
-            sigmas: Optional pre-shift noise grid.
-            mu: Dynamic shift passed by the generation adapter.
-            timesteps: Optional upstream timestep grid.
-        """
-        super().set_timesteps(
-            num_inference_steps=num_inference_steps,
-            device=device,
-            sigmas=sigmas,
-            mu=mu,
-            timesteps=timesteps,
-        )
-        self._record_sampling_time_shift(static_shift=self.shift, mu=mu)
 
     @property
     def is_eval(self):

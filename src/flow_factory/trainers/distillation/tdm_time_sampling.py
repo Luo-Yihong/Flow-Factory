@@ -16,9 +16,95 @@
 
 from __future__ import annotations
 
+import inspect
 import math
+import sys
+from contextlib import contextmanager
+from functools import wraps
+from typing import Any, Iterator
 
 import torch
+
+
+@contextmanager
+def capture_generation_shift(scheduler: Any) -> Iterator[list[float]]:
+    """Capture one rollout's effective shift while preserving the scheduler method.
+
+    Args:
+        scheduler: Primary scheduler used by the current generation call.
+
+    Yields:
+        A list containing the captured shift after a successful generation call.
+
+    Raises:
+        ValueError: No schedule was built, shifts differ within the rollout, or the
+            schedule is not a supported pure flow shift.
+    """
+    original = scheduler.set_timesteps
+    signature = inspect.signature(original)
+    absent = object()
+    instance_method = vars(scheduler).get("set_timesteps", absent)
+    shifts: list[float] = []
+
+    @wraps(original)
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        arguments = signature.bind(*args, **kwargs)
+        arguments.apply_defaults()
+        shift = _generation_shift(scheduler, arguments.arguments.get("mu"))
+        result = original(*args, **kwargs)
+        if shifts and shift != shifts[0]:
+            raise ValueError("pre_shift_uniform requires one effective shift per rollout")
+        if not shifts:
+            shifts.append(shift)
+        return result
+
+    scheduler.set_timesteps = capture
+    try:
+        yield shifts
+        if not shifts:
+            raise ValueError("pre_shift_uniform did not capture a set_timesteps() call")
+    finally:
+        if instance_method is absent:
+            del scheduler.set_timesteps
+        else:
+            scheduler.set_timesteps = instance_method
+
+
+def _generation_shift(scheduler: Any, mu: float | None) -> float:
+    """Resolve the effective rational flow shift from the actual generation call."""
+    config = scheduler.config
+    modifiers = [
+        name
+        for name in (
+            "shift_terminal",
+            "invert_sigmas",
+            "use_karras_sigmas",
+            "use_exponential_sigmas",
+            "use_beta_sigmas",
+        )
+        if config.get(name, False)
+    ]
+    if "use_flow_sigmas" in config and not config.use_flow_sigmas:
+        modifiers.append("use_flow_sigmas=False")
+    if modifiers:
+        raise ValueError(
+            "pre_shift_uniform requires a pure flow-shift schedule; "
+            f"unsupported schedule modifiers: {modifiers!r}"
+        )
+    if config.get("use_dynamic_shifting", False):
+        kind = config.get("time_shift_type", "exponential")
+        if mu is None or kind not in ("linear", "exponential"):
+            raise ValueError(f"Cannot resolve generation shift: type={kind!r}, mu={mu!r}")
+        shift = (
+            (math.exp(mu) if mu <= math.log(sys.float_info.max) else float("inf"))
+            if kind == "exponential"
+            else mu
+        )
+    else:
+        shift = getattr(scheduler, "shift", config.get("flow_shift"))
+    if shift is None or not math.isfinite(shift) or shift <= 0:
+        raise ValueError(f"Generation shift must be positive and finite, received {shift!r}")
+    return float(shift)
 
 
 def sample_interval_sigma(

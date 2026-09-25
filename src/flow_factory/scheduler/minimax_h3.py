@@ -26,7 +26,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from ..utils.base import to_broadcast_tensor
 from ..utils.noise_schedule import flow_match_sigma
 from .abc import SDESchedulerMixin, SDESchedulerOutput
-from .time_shift import FlowSamplingTimeShiftMixin
 
 
 @dataclass
@@ -43,9 +42,7 @@ class MiniMaxH3SDESchedulerOutput(SDESchedulerOutput):
     """
 
 
-class MiniMaxH3SDEScheduler(
-    FlowSamplingTimeShiftMixin, SchedulerMixin, ConfigMixin, SDESchedulerMixin
-):
+class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
     """Apply MiniMax H3 data-ward velocity with Flow-Factory SDE dynamics."""
 
     _compatibles: List[str] = []
@@ -229,7 +226,6 @@ class MiniMaxH3SDEScheduler(
             self._validate_sigma_schedule(schedule)
             num_inference_steps = schedule.numel() - 1
         self._validate_sigma_schedule(schedule)
-        self._record_sampling_time_shift(static_shift=self.shift, mu=None)
         self.sigmas = schedule.to(device=device)
         self.timesteps = self.sigmas[:-1] * 1000
         self.model_timesteps = 1 - self.sigmas[:-1]
