@@ -1,6 +1,6 @@
 # Hard Constraints
 
-Quick index: **#1-5** Registry | **#6-10** Training Pipeline | **#11-14** Base Classes | **#15-17** Config | **#18-20** Distributed | **#21-27** Code Quality | **#28-29** Agent Workflow
+Quick index: **#1-5** Registry | **#6-10** Training Pipeline | **#11-14** Base Classes | **#15-17** Config | **#18-20** Distributed | **#21-27** Code Quality | **#28-30** Agent Workflow
 
 These constraints MUST NOT be violated. Consult this file before making any code changes.
 
@@ -271,3 +271,31 @@ When an agent (sub-agent, background agent, or any automated tool) needs to writ
 
 ### 29. Examples Directory Convention
 Example configs follow the path convention `examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml`. Model directory names use underscores matching the config `model_type` field (e.g., `sd3_5`, `flux1_kontext`). The baseline config for a model is `default.yaml`. When adding, renaming, or removing examples, update all path references in `README.md`, `guidance/*.md`, and `examples/README.md`.
+
+### 30. Framework-Upgrade GPU Merge Gate
+Any broad change to the execution kernel, training dataflow, distributed backend, model
+loading/preparation, sampler or batch geometry, reward/advantage pipeline, or optimizer/checkpoint
+infrastructure MUST pass the exact-commit framework-upgrade GPU campaign before merge. The
+machine-readable source of truth is `config/gpu_validation/framework_upgrade.yaml`. Its core jobs
+must complete one full acquisition/optimization cycle on DDP, DeepSpeed ZeRO-2, and FSDP2; focused
+supplemental jobs may reuse that backend coverage while isolating a constrained pairwise capability
+matrix. Reward-pipeline changes MUST select task-appropriate rewards and cover every affected
+overlap-capable trainer, compatible sampler placement, ready/ordered policy, single/multi-source
+deployment, reducer ordering, and packed-batch boundary declared by the manifest. Enabled overlap
+jobs must use real async pointwise services through CPU clients. Cells marked `required` must prove
+optimization progressed while reward work remained pending; `observe_only` is reserved for an
+explicit fast-service boundary that still exercises the tile stream and records whether physical
+overlap occurred. Synchronous or in-process rewards are explicit non-overlap boundary cases, never
+fabricated async evidence. Do not add sleeps or under-provision reward servers to manufacture
+concurrency.
+The reward-deployment/layout matrix is problem-specific constrained pairwise coverage, not a blind
+Cartesian product. Every enabled overlap cell must resolve to at least the manifest-declared number
+of independently schedulable optimizer work units; use per-run cycle overrides when an algorithm's
+minimal synchronous smoke cycle would otherwise collapse to one tile, without changing trainer
+semantics or inflating explicit synchronous boundary jobs.
+Skipped, capacity-blocked, or infrastructure-blocked jobs do not count as passes, and a launcher
+label is not backend evidence: the runtime distributed type and plugin version/stage must match the
+manifest. Validate the manifest and attached result bundle with
+`scripts/validate_gpu_campaign.py`. See `guidance/gpu_validation.md` for trigger scope, workload
+geometry, artifact requirements, and the distinction between this merge gate and performance
+benchmarks.

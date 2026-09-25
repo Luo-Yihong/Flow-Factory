@@ -1,9 +1,162 @@
 # GPU Validation Matrix
 
 This document defines the real-weight GPU validation contract and records the PR #220 execution
-result. The historical direct runs establish successful launch and training completion; a future
-formal campaign should additionally capture every artifact listed in the acceptance criteria
-below.
+result. The historical direct runs establish successful launch and training completion; current
+framework-wide changes are governed by the exact-commit merge gate below.
+
+## Framework-upgrade merge gate
+
+Broad changes to the execution kernel, training dataflow, distributed backend, model loading or
+preparation, sampler or batch geometry, reward or advantage pipeline, or optimizer/checkpoint
+infrastructure must pass this gate before merge. A localized adapter, reward, or algorithm change
+may use a narrower affected matrix only when it does not alter one of those shared layers.
+
+The machine-readable source of truth is
+`config/gpu_validation/framework_upgrade.yaml`. Validate it and list the exact jobs with:
+
+```bash
+python scripts/validate_gpu_campaign.py
+python scripts/validate_gpu_campaign.py --list-jobs
+```
+
+The current manifest contains **45 mandatory jobs**: 36 core end-to-end jobs plus nine focused
+reward-overlap jobs. The core is **12 model/algorithm pairs x 3 backends**:
+
+| Profile | Algorithms | Backend cells | Purpose |
+|---|---:|---:|---|
+| Qwen-Image-2.1 OCR text-to-image | GRPO | 3 | Coupled reward training, GDPO aggregation, async AES + HY-OCR overlap, subgroup tiles |
+| SD3.5 text-to-image | NFT, SFT, offline DPO, online DPO | 12 | Decoupled reward, both dataset paradigms, and rank-local online pairing |
+| Bagel ordered multi-image editing with `per_device_batch_size=2` | TDM | 3 | Packed-sequence microbatches and two-role reward-free distillation |
+| MiniMax H3 text-to-audio-video | all six algorithms | 18 | Structured video/audio trajectories, rewards, codecs, and multi-role replay |
+
+The core algorithm axis is exactly `{grpo, nft, sft, offline-dpo, online-dpo, tdm}` and every row runs
+with DDP, DeepSpeed ZeRO-2, and FSDP2. A generated-acquisition job completes one rollout followed
+by every optimizer/role update declared in the manifest. An offline job traverses one finite
+dataset containing exactly 32 records at `per_device_batch_size=1` and
+`gradient_accumulation_steps=1`, producing exactly one optimizer step on 32 ranks. TDM must report
+both its generator and fake-role updates.
+
+The nine supplemental jobs do not repeat the backend Cartesian product. Together with four reused
+DDP core cells, they form a constrained pairwise critical-path matrix across all overlap-capable
+trainers (`grpo`, `grpo-guard`, `dppo`, `nft`, `awm`, `crd`, `dgpo`, `online-dpo`, and `tdm-r1`),
+the four compatible placements (`subgroup_tile`, `global_batch`, `global_tile`, and `rank_local`),
+single- and multi-source rewards, `sum` and `gdpo`, and `ready` and `ordered` scheduling. It also
+contains a Bagel GRPO case at `per_device_batch_size=2`. This is intentionally not a blind
+reward x layout x trainer x backend Cartesian product: online DPO requires rank-local complete
+groups, DGPO requires complete groups in a global microbatch, local GPU rewards cannot satisfy the
+CPU-async overlap contract, and the three core Qwen/NFT/online-DPO rows already cross the overlap
+kernel with every backend.
+
+### Reward deployment and overlap topology
+
+The manifest selects rewards by task and by the capability being tested:
+
+| Profile | Deployment | Server topology | Use |
+|---|---|---|---|
+| `remote-aes-async` | External pointwise HTTP service; CPU client | 9 replicas x TP8 = 72 GPUs | Image quality and single-source async paths |
+| `remote-hy-ocr-async` | External pointwise OpenAI-compatible service; CPU client | DP8 = 8 GPUs | OCR-sensitive fast-service and packed-batch boundary path |
+| `remote-aes-plus-hy-ocr-async` | Both remote services, independently scheduled | 80 reward GPUs total | Multi-reward tail latency, GDPO, and ready scheduling |
+| `local-clap-plus-imagebind-sync` | In-process CUDA rewards | Training ranks | H3 audio/video semantics; no overlap claim |
+
+Tracked configuration contains endpoint environment-variable names, never cluster addresses or
+temporary client implementations. The campaign workspace supplies those values and clients, and
+they must remain outside the pull request. Evidence must include a real health/inference probe,
+the exact deployed topology, per-source score cardinality and p50/p95/max latency, and the
+resolved reward configuration. Writing `async_reward: true` without proving the service actually
+ran is not a pass.
+
+Every enabled overlap job uses pointwise remote rewards, CPU clients, an independent executor pool
+per reward source, `global_std=false`, and at least two independently ready work units. Jobs marked
+`overlap_observation: required` must record a positive
+`timing/reward_overlap/optimization_overlap_seconds` and prove optimization began while some reward
+requests were still pending. `ready` is the production default and may select complete
+work units out of acquisition order. The ordered Qwen canary holds model, data, rewards, sampler,
+and seed fixed while changing only the selection policy; it verifies the supported deterministic
+fallback without weakening the ready-path requirement. Out-of-order completion is recorded but is
+not itself mandatory because external service timing is nondeterministic.
+
+The Bagel `per_device_batch_size=2` HY-OCR cell is explicitly `observe_only`: it still must execute
+the async tile-stream path, score every sample, expose at least two work units, and report the full
+timing series, but a healthy DP8 OCR service can drain all requests before optimization starts.
+That zero-overlap outcome is a measured fast-service boundary, not a failed concurrency claim.
+DPPO uses the slower AES deployment so every overlap-capable trainer still has a separate
+`required` cell that proves physical reward/optimization concurrency. This distinction prevents
+artificial sleeps or deliberately under-provisioned reward servers from becoming part of the gate.
+
+The minimum is enforced twice: manifest construction rejects an overlap cell whose resolved cycle
+contains fewer than two optimizer work units, and result validation rejects runtime evidence with
+fewer than two completed units. Optimizer counts are therefore selected per concrete profile, not
+silently changed in the trainer: production-shaped NFT/AWM/DGPO overlap canaries use two updates,
+and rank-local online DPO uses three because the 96 groups place three complete pairs on each rank.
+The H3 synchronous boundary keeps its one-update NFT/online-DPO cycle because it makes no overlap
+claim. Multi-role TDM-R1 must report one update for each of its fake, surrogate, and generator
+roles; omitting the reward-trained surrogate is a failed cycle, not a two-role TDM equivalent.
+
+### Gate geometry
+
+All jobs use 32 training GPUs (four 8-GPU nodes), BF16, evaluation disabled, checkpoint saving
+disabled, and a 1024-pixel output long edge. Image reward jobs retain the production-shaped
+`unique_sample_num_per_epoch=96`, `group_size=16`, and `per_device_batch_size=1` geometry. The
+Qwen subgroup-tile jobs use eight-rank subgroups; online DPO remains rank-local because
+pair construction requires rank-local complete groups. Bagel TDM uses
+`per_device_batch_size=2`, `group_size=1`, and `unique_sample_num_per_epoch=128`, with sample
+shuffling disabled so every packed microbatch retains its original composition.
+
+H3 retains the expensive semantic constraints rather than the production sample count: a
+`[576, 1024]` output, 124 frames at 24 fps (5.17 seconds), neutral guidance, and two denoising
+steps. Its reward algorithms use the smallest non-degenerate `group_size=2` and
+`unique_sample_num_per_epoch=32`; TDM uses one sample per rank. CLAP and ImageBind run
+synchronously and cover audio/text and audio/video semantics respectively. H3 does not claim
+reward/optimization overlap. Image profiles remain the production-scale overlap benchmark; the
+H3 slice is an end-to-end structured-media correctness and explicit non-overlap boundary gate.
+H3 offline DPO explicitly retains its algorithm recipe's LoRA rank/alpha of 16. On replicated-
+parameter backends, its two policy arms additionally use the adapter-declared pairwise activation-
+storage policy: saved autograd tensors are offloaded to pinned CPU memory and restored for
+backward. FSDP2 keeps the backend-owned sharded path and does not add this offload. Together these
+choices bound the pairwise peak without reducing the spatial, temporal, batch, or optimizer-step
+contract.
+
+Most production image paths retain `unique_sample_num_per_epoch=96` and `group_size=16`. One
+supplemental `global_tile` job deliberately uses `group_size=24`: with a 32-rank global forward
+batch, a complete work unit spans three global batches and contains four groups. Keeping K=16 in
+that cell would collapse `global_tile` into `global_batch` and would not test tiled closure.
+
+Bagel records contain exactly two ordered reference images, and its packed path keeps both samples
+in each `per_device_batch_size=2` microbatch intact. H3 offline jobs use the
+`text_to_audio_video` fixture contract and retain ordered `(video, audio)` supervision.
+The recipe path in each run is only the algorithm-specific starting point: profile, geometry,
+workload, backend, and one-cycle fields from the manifest take precedence in the resolved config.
+
+### Launch and evidence contract
+
+Launch every job through `ff-train`/Accelerate with the backend config declared in the manifest.
+Raw `torchrun` bypasses Accelerate plugin construction and therefore counts only as DDP; naming a
+raw launch `zero2` or `fsdp2` is not evidence. Each job must record the observed runtime backend:
+`MULTI_GPU` for DDP, `DEEPSPEED` with `zero_stage=2`, or `FSDP` with `fsdp_version=2`.
+
+Results must be bound to the full tested commit SHA and the SHA-256 digest of the manifest. Every
+job attaches its command, resolved configuration, environment manifest, complete logs, and compact
+metrics. The observations must prove all ranks completed, losses/gradient metrics were finite,
+the intended parameters changed, the world size was 32, the runtime backend matched, and the exact
+one-cycle update counts completed. They also echo the exact task, model/checkpoint, geometry,
+starting recipe, workload, reward profile, and offline fixture contract from the manifest; changing
+only the job label cannot satisfy the validator. Validate the final bundle with:
+
+```bash
+python scripts/validate_gpu_campaign.py --results /path/to/results.json
+```
+
+Core result job IDs are `{profile}__{backend}__{algorithm}`; supplemental IDs are declared
+verbatim in the manifest. The result set must exactly equal all 45 jobs. `skipped`, `capacity`,
+`infrastructure`, timeout, or any other non-passing state
+blocks merge; it remains useful failure evidence but is not a pass. If the code changes after the
+campaign, the exact-commit requirement makes the evidence stale and the affected jobs must be run
+again.
+
+This gate establishes one-cycle end-to-end correctness, not convergence or throughput. Keep
+reward-overlap timing and scalability benchmarks as separate campaigns with their full timing
+series. The historical PR #220 matrix below remains model-family semantic certification and does
+not replace the current exact-commit gate.
 
 ## PR #220 result
 
