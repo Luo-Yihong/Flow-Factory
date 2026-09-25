@@ -343,6 +343,12 @@ def _trainer(**overrides: Any) -> TDMTrainer:
         "use_huber": False,
         "huber_c": 1e-3,
         "tdm_snr_gamma": 5.0,
+        "tdm_timestep_sampling": "truncated_logit_normal",
+        "tdm_logit_mean": 0.0,
+        "tdm_logit_std": 1.0,
+        # Keep original trajectory tests on disjoint intervals; reverse is tested separately.
+        "tdm_interval_mode": "disjoint",
+        "tdm_t_max": 0.98,
         "replay_rtol": 1e-6,
         "replay_atol": 1e-6,
     }

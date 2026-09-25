@@ -539,6 +539,73 @@ train:
     tdm_snr_gamma: 5.0
 ```
 
+Score-query intervals are selected independently of the sampling distribution:
+
+- `train.tdm_interval_mode: reverse` (default): for a generated sigma interval `[a, b]`,
+  query scores in `(a, tdm_t_max)`. `train.tdm_t_max` defaults to **0.98**, in the primary
+  component's post-shift sigma space. It must be in `(0, 1]` and above every lower
+  boundary; an empty interval fails explicitly (for example, large K may require a
+  larger `tdm_t_max`).
+- `train.tdm_interval_mode: disjoint`: query scores in the original interval `(a, b)`;
+  `tdm_t_max` does not cap this mode.
+
+For K=4 and shift=3, the intervals are:
+
+| Generated sigma interval | Disjoint queries | Reverse queries (`tdm_t_max=0.98`) |
+|---|---|---|
+| `[0.9, 1]` | `(0.9, 1)` | `(0.9, 0.98)` |
+| `[0.75, 0.9]` | `(0.75, 0.9)` | `(0.75, 0.98)` |
+| `[0.5, 0.75]` | `(0.5, 0.75)` | `(0.5, 0.98)` |
+| `[0, 0.5]` | `(0, 0.5)` | `(0, 0.98)` |
+
+Only the loss query interval changes. Generated trajectories and replay endpoints retain
+stored coordinates. Multimodal adapters map the primary upper limit to their own component
+coordinates; `tdm_t_max` is not an independent numeric cap on every modality.
+
+Score-query times use `train.tdm_timestep_sampling` (also inherited by TDM-R1):
+
+- `truncated_logit_normal` (default): for each selected query interval `(a, b)` in noise
+  sigma space, draw `sigma = F^-1(F(a) + r * (F(b) - F(a)))`, with `r ~ U(0,1)`.
+  `F` is the CDF of `sigmoid(N(tdm_logit_mean, tdm_logit_std^2))`; defaults are 0 and 1.
+  The conditional density is `p(sigma) / (F(b) - F(a))` inside the interval and zero
+  outside. There is no subsequent shift, sample clipping from the original distribution,
+  or stretching of a sigmoid draw into each interval.
+- `pre_shift_uniform`: invert the generation shift at both actual interval endpoints,
+  sample uniformly between those pre-shift endpoints, and apply the same shift again.
+  For `S(u) = gamma*u / (1 + (gamma-1)*u)`, the inverse is
+  `S^-1(sigma) = sigma / (gamma - (gamma-1)*sigma)`.
+
+There is no independent `tdm_time_shift` parameter. Generation captures the effective
+scheduler shift on each rollout batch, including dynamic exponential (`gamma=exp(mu)`)
+and linear (`gamma=mu`) shifts. TDM snapshots it per sample before another batch or
+an evaluation can change scheduler state. FlowMatchEuler, flow-sigma UniPC, and MiniMax H3
+expose this contract. Custom schedulers must expose `sampling_time_shift`; additional
+terminal stretching, sigma inversion, or Karras/exponential/beta grid conversions are
+rejected by `pre_shift_uniform` because they are not a pure flow shift.
+
+For K=4 and shift=3, the actual boundaries are `1000 -> 900 -> 750 -> 500 -> 0`.
+Each example and boundary draws independently; fake and generator phases redraw.
+All K boundaries remain equally weighted: this is an equal mixture of interval
+conditionals, not the global untruncated logit-normal distribution. Existing fake-score
+importance weighting is unchanged.
+
+Probability calculations use float64, with tail reflection for numerical stability.
+Unrepresentable conditional probability intervals raise an error. Output rounding protects
+strictly interior primary times; mapped component endpoint collisions still trigger a redraw.
+New sampling semantics, distribution parameters, scheduler configuration, and effective
+static shifts are locked by exact-state resume identity. Old uniform-in-shifted-time
+checkpoints require a weight-only load (`model.resume_type: full` or `lora`); they cannot exactly
+resume the new sampling objective.
+
+```yaml
+train:
+    tdm_interval_mode: reverse  # Or: disjoint
+    tdm_t_max: 0.98  # Post-shift sigma; reverse only
+    tdm_timestep_sampling: truncated_logit_normal  # Or: pre_shift_uniform
+    tdm_logit_mean: 0.0
+    tdm_logit_std: 1.0
+```
+
 See [`examples/tdm/lora/sd3_5/ocr.yaml`](../examples/tdm/lora/sd3_5/ocr.yaml)
 and [`examples/tdm/lora/minimax_h3_t2va/default.yaml`](../examples/tdm/lora/minimax_h3_t2va/default.yaml).
 

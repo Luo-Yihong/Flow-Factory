@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from .dmd2 import DMD2TrainingArguments, _finite_float
 
@@ -36,10 +36,41 @@ class TDMTrainingArguments(DMD2TrainingArguments):
     huber_c: float = 1e-3
     tdm_snr_gamma: float = 5.0
     tdm_importance_clip: float = 20.0
+    tdm_timestep_sampling: Literal["truncated_logit_normal", "pre_shift_uniform"] = (
+        "truncated_logit_normal"
+    )
+    tdm_logit_mean: float = 0.0
+    tdm_logit_std: float = 1.0
+    tdm_interval_mode: Literal["reverse", "disjoint"] = "reverse"
+    tdm_t_max: float = 0.98
 
     def __post_init__(self) -> None:
         """Validate trajectory count, replay tolerances, and Huber controls."""
         super().__post_init__()
+        if self.tdm_interval_mode not in ("reverse", "disjoint"):
+            raise ValueError(
+                "train.tdm_interval_mode must be 'reverse' or 'disjoint', "
+                f"received {self.tdm_interval_mode!r}"
+            )
+        self.tdm_t_max = _finite_float(self.tdm_t_max, "train.tdm_t_max", allow_zero=False)
+        if self.tdm_t_max > 1:
+            raise ValueError("train.tdm_t_max must be in (0, 1] (post-shift sigma)")
+        if self.tdm_timestep_sampling not in ("truncated_logit_normal", "pre_shift_uniform"):
+            raise ValueError(
+                "train.tdm_timestep_sampling must be 'truncated_logit_normal' or "
+                f"'pre_shift_uniform', received {self.tdm_timestep_sampling!r}"
+            )
+        if isinstance(self.tdm_logit_mean, bool):
+            raise TypeError("train.tdm_logit_mean must be a finite number, not bool")
+        try:
+            self.tdm_logit_mean = float(self.tdm_logit_mean)
+        except (TypeError, ValueError) as error:
+            raise TypeError("train.tdm_logit_mean must be a finite number") from error
+        if not math.isfinite(self.tdm_logit_mean):
+            raise ValueError("train.tdm_logit_mean must be finite")
+        self.tdm_logit_std = _finite_float(
+            self.tdm_logit_std, "train.tdm_logit_std", allow_zero=False
+        )
         if not isinstance(self.use_huber, bool):
             raise TypeError(
                 f"expected train.use_huber as a bool, received {type(self.use_huber).__name__}: "

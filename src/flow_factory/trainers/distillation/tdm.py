@@ -31,6 +31,7 @@ from ...hparams import Arguments, TDMTrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
 from ...models.trajectory_bridge import resolve_replay_projection_times
+from ...rewards import RewardBuffer
 from ...samples import (
     BaseSample,
     ComponentTimes,
@@ -39,6 +40,7 @@ from ...samples import (
     StackedSampleBatch,
 )
 from ..abc import BaseTrainer
+from ..common.runtime_identity import build_default_execution_identity_payload
 from .distillation_runtime import (
     as_role_microbatches,
     detach_state,
@@ -85,6 +87,54 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
 
     paradigm: ClassVar[Literal["distillation"]] = "distillation"
     execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
+
+    def runtime_execution_identity_payload(self) -> Dict[str, Any]:
+        """Lock the sampling contract and effective static shifts for exact resume.
+
+        Returns:
+            Default identity plus TDM sampling semantics. Dynamic shift configuration
+            and input geometry are already locked by the shared execution/data schema.
+        """
+        payload = build_default_execution_identity_payload(self)
+        payload["tdm_time_sampling"] = {
+            "version": 1,
+            "static_shifts": {
+                name: (
+                    None
+                    if getattr(scheduler, "config", {}).get("use_dynamic_shifting", False)
+                    else getattr(scheduler, "shift", None)
+                )
+                for name, scheduler in self.adapter.scheduler_group.items()
+            },
+        }
+        return payload
+
+    def sample_batch(
+        self, batch: Dict[str, Any], reward_buffer: RewardBuffer | None = None, **kwargs: Any
+    ) -> List[BaseSample]:
+        """Collect samples and snapshot the generation shift before another rollout.
+
+        Args:
+            batch: Input conditions for one generation batch.
+            reward_buffer: Optional TDM-R1 reward buffer.
+            **kwargs: Generation options forwarded to the shared sampling pipeline.
+
+        Returns:
+            Samples carrying the effective primary shift for pre-shift uniform replay.
+        """
+        samples = super().sample_batch(batch, reward_buffer=reward_buffer, **kwargs)
+        if self.training_args.tdm_timestep_sampling == "pre_shift_uniform":
+            primary = self.adapter.trajectory_component_order[0]
+            scheduler = self.adapter.scheduler_group[primary]
+            if not hasattr(type(scheduler), "sampling_time_shift"):
+                raise ValueError(
+                    "pre_shift_uniform requires a scheduler exposing sampling_time_shift; "
+                    f"received {type(scheduler).__name__}"
+                )
+            shift = scheduler.sampling_time_shift
+            for sample in samples:
+                sample.extra_kwargs["_tdm_sampling_shift"] = shift
+        return samples
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM's published defaults.
@@ -377,7 +427,9 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         """Move and stack one boundary unit without generated media."""
         if not replay_samples:
             raise ValueError("expected a non-empty TDM boundary unit, received no samples")
-        return BaseSample.stack([sample.to(self.accelerator.device) for sample in replay_samples])
+        batch = BaseSample.stack([sample.to(self.accelerator.device) for sample in replay_samples])
+        batch.pop("_tdm_sampling_shift", None)
+        return batch
 
     def _replay_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
         """Return allow-listed adapter arguments not already owned by the batch."""

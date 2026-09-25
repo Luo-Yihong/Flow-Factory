@@ -42,6 +42,14 @@ Throughout the codebase, two related but distinct scales are used for time:
 - **Lesson**: One-ULP tolerance is appropriate only for redundant representations of the same coordinate. Discrete multi-component endpoints must retain producer authority, while continuous mappings need bounded rejection when no open-interior representation is produced.
 - **Related Constraint**: N/A
 
+### Conditional TDM score-query sampling
+- **Date**: 2026-09-25
+- **Symptom**: TDM sampled uniformly in the already shifted scheduler interval.
+- **Root Cause**: The interval sampler treated actual scheduler coordinates as the uniform source space.
+- **Fix**: TDM and TDM-R1 default to conditional logit-normal in actual sigma space; optional pre-shift uniform inverts and reapplies the generation shift captured per rollout sample. Float64 CDF inversion preserves the within-interval density up to its normalizing constant. Reverse query intervals default to `(stored_lower, 0.98)` in primary sigma space; disjoint preserves the original upper endpoint and ignores `tdm_t_max`. Adapters map the reverse cap to every component while replay keeps stored endpoints. Exact resume locks the changed semantics.
+- **Lesson**: A shifted interval's endpoints do not define its sampling density. Preserve the intended source distribution and generation-owned shift; do not stretch sigmoid draws or clamp unconditional samples to emulate truncation. Equal boundary weighting remains an equal mixture of conditionals.
+- **Related Constraint**: #7, #18a.
+
 ## Cross-refs
 
 - UP: [`constraints.md` #7](../constraints.md#7-coupled-vs-decoupled-paradigm), [Architecture Timestep and Sigma Convention](../architecture.md#timestep--sigma-convention)

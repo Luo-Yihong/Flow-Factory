@@ -61,6 +61,11 @@ log:
 
 train:
   trainer_type: "tdm-r1"
+  tdm_interval_mode: reverse  # Options: reverse, disjoint
+  tdm_t_max: 0.98  # Post-shift sigma upper bound; only used by reverse
+  tdm_timestep_sampling: truncated_logit_normal  # Options: truncated_logit_normal, pre_shift_uniform
+  tdm_logit_mean: 0.0  # Normal mean in actual sigma logit space
+  tdm_logit_std: 1.0  # Positive normal std; pre_shift_uniform reuses the generation shift
   reward_optimization_overlap: false  # Off by default; supported runtime-reward trainers only
   reward_optimization_overlap_mode: "ready"  # Options: ordered, ready
   reward_optimization_overlap_poll_interval: 0.05  # Seconds between readiness polls
