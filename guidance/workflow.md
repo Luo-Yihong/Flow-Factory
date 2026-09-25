@@ -245,7 +245,7 @@ with the finite-loader path above and enters its objective through `optimize_bat
 
 ### How It Works
 
-The `DistributedKRepeatSampler` handles this:
+`DistributedKRepeatSampler` is the legacy arbitrary-placement layout:
 
 ```python
 # src/flow_factory/data_utils/sampler.py — DistributedKRepeatSampler.__iter__()
@@ -270,8 +270,17 @@ def __iter__(self):
 ### Key Points
 
 - **Deterministic seeding**: All ranks share the same `seed + epoch` generator, ensuring identical permutation and K-repeat ordering — no explicit cross-rank communication needed.
-- **Automatic alignment**: The sampler adjusts `unique_sample_num` upward to ensure `M * K` is evenly divisible by `batch_size * num_replicas`.
-- **Group identification**: Each sample carries a `unique_id` (hash of prompt + conditions). During advantage computation, samples are grouped by this ID across all ranks.
+- **Automatic alignment**: Argument resolution adjusts `unique_sample_num` upward so the selected
+  sampler closes its global batches and group windows.
+- **Group identification**: The canonical comparison key is the exact int64 pair
+  `(source_id, unique_id)`. The source namespace prevents equal prompt/condition hashes from
+  independent datasets from sharing reward context.
+- **Group-preserving layouts**: `group_contiguous` puts every K-group on one rank;
+  `group_distributed` closes groups in every global microbatch; and `group_tiled` closes them in
+  the smallest `K / gcd(world_size * per_device_batch_size, K)`-microbatch window. The selected
+  algorithm declares which placements it can consume.
+- **Multi-source overlap**: source mixing shuffles whole group-complete windows, not individual
+  batches, so one comparison group never changes source midway through acquisition.
 
 ### Configuration
 
@@ -389,6 +398,7 @@ def compute_rewards(self, samples, store_to_samples=True, epoch=0, split='all'):
 - **Automatic deduplication**: If multiple reward entries share the same model config, they reuse a single model instance.
 - **Flexible inputs**: Reward models declare `required_fields` (e.g., `("prompt", "image")`) and optionally receive raw tensors (`use_tensor_inputs=True`) or PIL images.
 - **Remote reward servers**: For reward models with incompatible dependencies, Flow-Factory supports HTTP-based reward computation in isolated environments.
+- **Incremental readiness**: Supported trainers can seal an async-only `RewardBuffer` after rollout and consume complete reward tiles while slower tiles are still being scored.
 
 ### Configuration
 
@@ -415,7 +425,7 @@ rewards:
 
 | | Description |
 |---|---|
-| **Input** | Per-sample rewards (`Dict[str, Tensor]`) and sample list with `unique_id` |
+| **Input** | Per-sample rewards (`Dict[str, Tensor]`) and samples with canonical `(source_id, unique_id)` identity |
 | **Output** | Per-sample advantage scalar stored in `sample.extra_kwargs['advantage']` |
 
 ### How It Works
@@ -426,7 +436,7 @@ def compute_advantages(self, samples, rewards, store_to_samples=True, aggregatio
     # Thin wrapper: resolve the aggregation strategy, then delegate to
     # AdvantageProcessor (advantage/advantage_processor.py). The processor is
     # communication-aware and auto-selects the gather-vs-local path; it performs
-    # the gather -> weighted-aggregate -> group-by-unique_id -> normalize ->
+    # the gather -> weighted-aggregate -> group-by-(source_id, unique_id) -> normalize ->
     # scatter sequence summarized below.
     aggregation_func = aggregation_func or self.training_args.advantage_aggregation
     return self.advantage_processor.compute_advantages(
@@ -442,20 +452,22 @@ def compute_advantages(self, samples, rewards, store_to_samples=True, aggregatio
 | Strategy | Formula | Use Case |
 |----------|---------|----------|
 | `sum` | $A = \text{normalize}(\sum_i w_i \cdot r_i)$ | Default GRPO: advantage of weighted reward sum |
-| `gdpo` | $A = \text{BN}(\sum_i w_i \cdot A_i)$ | Per-reward normalization first, then combine |
+| `gdpo` | $A = \sum_i w_i \cdot A_i$, with optional acquisition BN | Per-reward group normalization first, then combine |
 
 ### Key Points
 
-- **Cross-rank synchronization**: Advantages are computed globally — rewards from all ranks are gathered, normalized, then scattered back. This ensures consistent group-level statistics.
+- **Cross-rank synchronization**: Ordinary cross-rank feedback gathers rewards and exact int64
+  identities separately. Streamed cross-rank work reuses one acquisition-level identity mapping
+  and reduces packed group statistics, avoiding a per-work-unit reward/identity gather.
 - **Group-relative normalization**: Within each group (same prompt), rewards are zero-centered and variance-normalized. This makes the advantage signal invariant to absolute reward scale.
-- **Batch normalization** (GDPO): For multi-reward scenarios, GDPO normalizes each reward independently before combining, preventing one reward from dominating.
+- **Optional batch normalization** (GDPO): GDPO always normalizes each reward independently within its group. `global_std: true` additionally normalizes the combined advantages across the acquisition; `false` leaves them group-local.
 
 ### Configuration
 
 ```yaml
 train:
   advantage_aggregation: 'sum'    # Options: 'sum', 'gdpo'
-  global_std: false               # Use global std instead of per-group std
+  global_std: false               # Keep normalization group-local; required for reward/optimization overlap
   adv_clip_range: [-5.0, 5.0]    # Clip advantages to prevent outliers
 ```
 
@@ -511,6 +523,95 @@ def optimize(self, samples):
                     accelerator.backward(loss)
                     optimizer.step()
 ```
+
+### Reward/Optimization Overlap
+
+Every generation trainer with runtime group-relative feedback can pipeline Stages 4–6 after
+rollout: GRPO, GRPO-Guard, DPPO, DiffusionNFT, AWM, CRD, DGPO, online DPO, and TDM-R1. The
+rollout still finishes before the first optimizer update, so one acquisition never mixes generation
+from different policy versions. Async reward work already submitted during rollout continues while
+complete tiles enter optimization:
+
+```text
+rollout batch 0 ──► reward futures ───────────────────────────────┐
+rollout batch 1 ──► reward futures ───────────────┐               │
+...                                               ▼               ▼
+rollout complete ──► globally ready tile 0 ──► optimize ──► next ready tile
+```
+
+Enable it with:
+
+```yaml
+train:
+  reward_optimization_overlap: true
+  reward_optimization_overlap_mode: ready  # ready | ordered
+  reward_optimization_overlap_poll_interval: 0.05
+  advantage_aggregation: sum
+  global_std: false
+  num_inner_epochs: 1
+  shuffle_samples: false
+
+data:
+  sampler_type: group_contiguous
+
+rewards:
+  - name: remote_quality
+    reward_model: flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel
+    device: cpu
+    async_reward: true
+    num_workers: 8
+    batch_size: 8
+    server_url: http://reward-router:8000
+```
+
+`ordered` waits for the earliest outstanding tile and preserves rollout update order. `ready`
+selects the lowest tile id among all globally ready tiles, bypassing a straggler but making update
+order dependent on reward latency. Both modes require identical tile selection on every rank.
+
+Generated acquisition cycles publish wall-clock metrics under a separate `timing/` namespace so
+profiling data does not share the `train/` namespace with loss, reward, and tile-geometry metrics.
+Durations are reduced as rank-wise maxima and therefore describe the distributed critical path:
+
+| Metric | Meaning |
+|---|---|
+| `timing/rollout_seconds` | Complete rollout duration. |
+| `timing/feedback_seconds` | Active reward-resolution and advantage-computation time on the training process. |
+| `timing/optimization_seconds` | Total optimizer work in the acquisition cycle. |
+| `timing/cycle_seconds` | End-to-end rollout, feedback, and optimization duration. |
+| `timing/reward_overlap/stream_seconds` | Time from the completed rollout until the streamed reward/optimization cycle finishes. |
+| `timing/reward_overlap/first_tile_seconds` | Time from the completed rollout until the first globally ready tile can optimize. |
+| `timing/reward_overlap/wait_seconds` | Sleep time between polls with no globally selectable tile. |
+| `timing/reward_overlap/coordination_seconds` | Local polling plus distributed readiness-coordination time. |
+| `timing/reward_overlap/preparation_seconds` | Reward-independent optimizer preparation performed while async rewards run (for example CRD pass 1 or TDM-R1 fake TTUR). |
+| `timing/reward_overlap/optimization_started_while_rewards_pending_seconds` | Duration of optimizer calls launched while later reward tiles were still pending. A reward may finish during the call, so this is scheduler exposure rather than exact hidden wall time. |
+| `timing/reward_overlap/optimization_started_after_rewards_ready_seconds` | Duration of optimizer calls launched after all reward tiles were ready. |
+| `timing/reward_overlap/optimization_started_while_rewards_pending_ratio` | Fraction of optimizer time whose calls began while later rewards were pending. |
+
+Overlap-disabled runs emit the four top-level metrics too, which makes a same-shape baseline
+directly comparable without changing logger grouping. Structural counters such as tile count remain
+under `train/reward_overlap/` because they are training state rather than durations.
+
+The tile planner describes how reward groups become optimizer examples. Rank-local objectives close
+both K-groups and gradient accumulation; online DPO counts one preference pair per K-group. DGPO
+and `group_distributed` TDM-R1 instead close groups in each global microbatch. TDM-R1 streams one
+rollout batch per tile while its surrogate gradients close across the full acquisition. Exact
+overlap is rejected when any training reward is synchronous, when either built-in aggregation
+would need acquisition-wide standardization (`global_std: true`), when a reward client is not
+CPU-side, or when the trainer has not declared the capability. With `global_std: false`, both
+weighted-sum and GDPO advantages close within complete groups and can optimize ready tiles. SFT,
+offline DPO, DiffusionOPD, DMD2, and reward-free TDM keep their existing execution path.
+
+Pointwise reward request batching is independent of optimizer work-unit geometry. Each reward
+model fills requests according to its own `batch_size`; a request may contain stable acquisition
+rows from adjacent work units, and its future gates each unit containing one of those rows. This
+keeps remote servers efficiently batched without changing group or gradient-accumulation
+boundaries. The configured poll interval is the initial readiness delay; consecutive unsuccessful
+global polls back off together (up to a bounded delay) and reset after a work unit advances.
+
+For a pack-composition-dependent adapter such as Bagel at `per_device_batch_size > 1`, an
+`AcquisitionManifest` records every original rollout microbatch. Ready scheduling may reorder
+whole work units, but validation rejects any unit that would split or repack one of those recorded
+batches.
 
 > **`shuffle_samples` and on-policy ratio**: the optimize loop reorders `samples` each inner epoch (`train.shuffle_samples: true`, the default). For adapters whose batched `forward()` is *pack-composition-dependent* (e.g. Bagel NaViT packing), this makes a training micro-batch pack a different sample set than its rollout pack, so the on-policy `ratio != 1`. Set `train.shuffle_samples: false` for such adapters (with matched sampling/training `per_device_batch_size`) so each micro-batch reproduces its rollout pack. See the train-inference consistency topic doc.
 
@@ -698,7 +799,7 @@ Epoch N
 │
 ├── prepare_feedback(samples)
 │   ├── Reward computation: RewardProcessor / buffer finalize → Dict[str, Tensor(32,)] per GPU
-│   └── Advantage computation: gather → group by unique_id → normalize → scatter
+│   └── Advantage computation: gather → group by (source_id, unique_id) → normalize → scatter
 │
 └── optimize(samples) — Stage 6 only (num_inner_epochs × batches × timesteps)
     ├── Shuffle 32 samples → re-batch

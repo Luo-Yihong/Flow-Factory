@@ -15,6 +15,7 @@
 # src/flow_factory/trainers/abc.py
 import json
 import os
+import time
 from abc import ABC
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
@@ -28,7 +29,10 @@ from typing import (
     Iterator,
     List,
     Literal,
+    Mapping,
     Optional,
+    Sequence,
+    Set,
     Tuple,
     Union,
 )
@@ -44,13 +48,19 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
-from ..advantage import AdvantageProcessor
+from ..advantage import AdvantageProcessor, CollectedGroupLayout
 from ..contracts.execution import (
     ONLINE_EXECUTION_CONTRACT,
     AcquisitionMode,
     ExecutionContract,
     FeedbackMode,
 )
+from ..contracts.feedback import resolve_feedback_reducer_contract
+from ..contracts.reward_overlap import (
+    NO_REWARD_OPTIMIZATION_OVERLAP,
+    RewardOptimizationOverlapContract,
+)
+from ..contracts.sampler import get_sampler_layout_contract
 from ..data_utils.dataset import METADATA_COLUMN
 from ..data_utils.loader import (
     get_eval_dataloaders,
@@ -66,11 +76,23 @@ from ..models.variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry
 from ..optimizer import build_optimizer
 from ..rewards import (
     BaseRewardModel,
+    GroupwiseRewardModel,
     MultiRewardLoader,
     RewardBuffer,
     RewardProcessor,
+    RewardTile,
+    RewardTileGeometry,
+    RewardTilePlan,
+    build_reward_tile_plan,
 )
-from ..samples import BaseSample, LatentState, NoisedState, StackedSampleBatch
+from ..samples import (
+    AcquisitionManifest,
+    BaseSample,
+    LatentState,
+    NoisedState,
+    StackedSampleBatch,
+    group_identity_rows,
+)
 from ..utils.base import (
     create_generator,
     create_generator_by_prompt,
@@ -116,6 +138,42 @@ from .role_optimization import (
 logger = setup_logger(__name__)
 
 
+@dataclass(frozen=True)
+class _RewardOverlapGroupInfo:
+    """Acquisition-level cross-rank group metadata reused by optimizers."""
+
+    local_group_identities: torch.Tensor
+    local_group_indices: torch.Tensor
+    num_groups: int
+
+    @property
+    def local_unique_ids(self) -> torch.Tensor:
+        """Return the unique-id column for objective-specific seed logic."""
+
+        return self.local_group_identities[:, 1]
+
+    @property
+    def local_source_ids(self) -> torch.Tensor:
+        """Return the source-id column of the canonical group identity."""
+
+        return self.local_group_identities[:, 0]
+
+    def validate_samples(self, samples: Sequence[BaseSample], *, context: str) -> None:
+        """Require the optimizer batch to match the cached identity mapping."""
+
+        identities = torch.tensor(
+            group_identity_rows(samples),
+            dtype=torch.int64,
+            device=self.local_group_identities.device,
+        )
+        if not torch.equal(identities, self.local_group_identities):
+            raise RuntimeError(
+                f"reward overlap group metadata does not match {context}: "
+                f"cached={self.local_group_identities.tolist()}, "
+                f"received={identities.tolist()}"
+            )
+
+
 class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, ABC):
     """
     Abstract Base Class for Flow-Factory trainers.
@@ -127,6 +185,9 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
     # MUST override this; leaving it None disables lossy acceleration.
     paradigm: ClassVar[Optional[Literal["coupled", "decoupled", "distillation"]]] = None
     execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
+    reward_optimization_overlap_contract: ClassVar[RewardOptimizationOverlapContract] = (
+        NO_REWARD_OPTIMIZATION_OVERLAP
+    )
     runtime_child_names: ClassVar[Tuple[str, ...]] = ()
 
     _ADAPTER_EMA_RUNTIME_CHILD = "adapter_ema"
@@ -153,6 +214,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         self.eval_reward_args = (
             config.eval_reward_args or config.reward_args
         )  # If `eval_reward_args` is not given, use `reward_args`
+        type(self).validate_reward_optimization_overlap(config)
 
         self.adapter = adapter
         self._validate_adapter_execution_contract()
@@ -163,6 +225,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         self._exact_resume_boundary_pending = False
         self._acquisition_cycle_active = False
         self._acquisition_cycle_incomplete = False
+        self._reward_overlap_acquisition_manifest: Optional[AcquisitionManifest] = None
         self.acquisition_driver: AcquisitionDriver = build_acquisition_driver(
             type(self).execution_contract
         )
@@ -339,6 +402,159 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 f"training arguments {type(training_args).__name__}: "
                 f"trainer={trainer_contract!r}, arguments={arguments_contract!r}"
             )
+
+    @classmethod
+    def validate_reward_optimization_overlap(cls, config: Arguments) -> None:
+        """Validate streamed reward optimization before heavyweight allocation."""
+        training_args = config.training_args
+        if not getattr(training_args, "reward_optimization_overlap", False):
+            return
+
+        capability = cls.reward_optimization_overlap_contract
+        if not isinstance(capability, RewardOptimizationOverlapContract):
+            raise TypeError(
+                f"trainer {cls.__name__}.reward_optimization_overlap_contract must be "
+                "RewardOptimizationOverlapContract, received "
+                f"{type(capability).__name__}: {capability!r}"
+            )
+        if not capability.supported:
+            raise ValueError(
+                f"trainer {cls.__name__} does not support train.reward_optimization_overlap"
+            )
+        if cls.execution_contract.feedback is not FeedbackMode.RUNTIME_REWARD:
+            raise ValueError(
+                "reward/optimization overlap requires execution feedback='runtime_reward', "
+                f"received {cls.execution_contract.feedback.value!r} for {cls.__name__}"
+            )
+
+        mode = training_args.reward_optimization_overlap_mode
+        if not capability.supports(mode):
+            raise ValueError(
+                f"trainer {cls.__name__} does not support reward overlap mode {mode!r}; "
+                f"supported={capability.scheduling_modes!r}"
+            )
+        sampler_contract = get_sampler_layout_contract(config.data_args.sampler_type)
+        if not capability.supports_sampler_group_placement(sampler_contract.group_placement):
+            raise ValueError(
+                f"trainer {cls.__name__} cannot use sampler "
+                f"{config.data_args.sampler_type!r} for reward/optimization overlap: "
+                f"group_placement={sampler_contract.group_placement!r}, "
+                f"supported={capability.sampler_group_placements!r}"
+            )
+        geometry = cls.reward_optimization_overlap_geometry(config)
+        expected_group_layout = {
+            "rank_local": "rank_local",
+            "global_batch": "cross_rank_sharded",
+            "global_tile": "cross_rank_tiled",
+        }[sampler_contract.group_placement]
+        if geometry.group_layout != expected_group_layout:
+            raise ValueError(
+                f"trainer {cls.__name__} produced reward group layout "
+                f"{geometry.group_layout!r} for sampler placement "
+                f"{sampler_contract.group_placement!r}; expected {expected_group_layout!r}"
+            )
+
+        reward_configs = list(config.reward_args or [])
+        if not reward_configs:
+            raise ValueError("reward/optimization overlap requires at least one training reward")
+        synchronous = tuple(cfg.name for cfg in reward_configs if not cfg.async_reward)
+        if synchronous:
+            raise ValueError(
+                "reward/optimization overlap requires async_reward=true for every training "
+                f"reward; synchronous rewards={synchronous!r}"
+            )
+        non_cpu = tuple(
+            (cfg.name, str(cfg.device))
+            for cfg in reward_configs
+            if getattr(cfg.device, "type", cfg.device) != "cpu"
+        )
+        if non_cpu:
+            raise ValueError(
+                "reward/optimization overlap requires device='cpu' for every training reward "
+                "client so reward CUDA work cannot contend with policy optimization; "
+                f"non-CPU rewards={non_cpu!r}"
+            )
+        reducer_contract = resolve_feedback_reducer_contract(
+            getattr(training_args, "advantage_aggregation", None),
+            global_std=getattr(training_args, "global_std", True),
+        )
+        if not reducer_contract.supports_group_complete_streaming:
+            raise ValueError(
+                "reward/optimization overlap requires a group-relative feedback reducer "
+                "without acquisition-wide statistics; "
+                f"reducer={reducer_contract.name!r}, "
+                f"combination_order={reducer_contract.combination_order!r}, "
+                f"requires_acquisition_statistics="
+                f"{reducer_contract.requires_acquisition_statistics}"
+            )
+        if training_args.num_inner_epochs != 1:
+            raise ValueError("reward/optimization overlap requires train.num_inner_epochs=1")
+        if training_args.shuffle_samples:
+            raise ValueError("reward/optimization overlap requires train.shuffle_samples=false")
+
+        accumulation_steps = training_args.gradient_accumulation_steps
+        if type(accumulation_steps) is not int or accumulation_steps < 1:
+            raise ValueError(
+                "reward/optimization overlap requires resolved integer "
+                f"gradient_accumulation_steps, received {accumulation_steps!r}"
+            )
+        optimizer_terms_per_batch = geometry.optimizer_terms_per_batch
+        optimizer_batches_per_acquisition = training_args.num_batches_per_epoch
+        if geometry.group_layout == "rank_local":
+            local_samples = (
+                training_args.num_batches_per_epoch * training_args.per_device_batch_size
+            )
+            if local_samples % training_args.group_size:
+                raise ValueError(
+                    "reward/optimization overlap requires rank-local acquisitions to contain "
+                    "complete groups: "
+                    f"samples={local_samples}, group_size={training_args.group_size}"
+                )
+            group_count = local_samples // training_args.group_size
+            examples_per_group = geometry.optimizer_examples_per_group or training_args.group_size
+            optimizer_examples = group_count * examples_per_group
+            if optimizer_examples % training_args.per_device_batch_size:
+                raise ValueError(
+                    "reward/optimization overlap requires acquisition-wide optimizer "
+                    "examples to form complete microbatches: "
+                    f"optimizer_examples={optimizer_examples}, "
+                    f"per_device_batch_size={training_args.per_device_batch_size}"
+                )
+            optimizer_batches_per_acquisition = (
+                optimizer_examples // training_args.per_device_batch_size
+            )
+        if (
+            optimizer_batches_per_acquisition * optimizer_terms_per_batch
+        ) % accumulation_steps != 0:
+            raise ValueError(
+                "reward/optimization overlap requires every acquisition to close complete "
+                "gradient accumulation windows: "
+                f"optimizer_batches_per_acquisition={optimizer_batches_per_acquisition}, "
+                f"optimizer_terms_per_batch={optimizer_terms_per_batch}, "
+                f"gradient_accumulation_steps={accumulation_steps}"
+            )
+
+    @classmethod
+    def reward_optimization_overlap_geometry(
+        cls,
+        config: Arguments,
+    ) -> RewardTileGeometry:
+        """Describe this objective's reward-group to optimizer mapping."""
+        sampler_contract = get_sampler_layout_contract(config.data_args.sampler_type)
+        group_layout = {
+            "rank_local": "rank_local",
+            "global_batch": "cross_rank_sharded",
+            "global_tile": "cross_rank_tiled",
+        }.get(sampler_contract.group_placement)
+        if group_layout is None:
+            raise ValueError(
+                f"sampler {sampler_contract.name!r} does not expose bounded group-complete "
+                "work units for reward/optimization overlap"
+            )
+        return RewardTileGeometry(
+            group_layout=group_layout,
+            optimizer_terms_per_batch=config.training_args.get_num_train_timesteps(config),
+        )
 
     @classmethod
     def validate_adapter_class_execution_contract(cls, adapter_cls: type) -> None:
@@ -749,22 +965,52 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         self.reward_models = self.reward_loader.get_training_reward_models()
         self.eval_reward_models = self.reward_loader.get_eval_reward_models()
         train_reward_configs = self.reward_loader.get_reward_configs("train")
-        # Initialize reward processor (training side only — eval-side
-        # processors are per-dataset, built below).
-        group_on_same_rank = self.config.data_args.sampler_type == "group_contiguous"
-        self.reward_processor = RewardProcessor(
-            accelerator=self.accelerator,
-            reward_models=self.reward_models,
-            reward_configs=train_reward_configs,
-            tokenizer=self.adapter.tokenizer,  # For prompt encoding/decoding,
-            group_on_same_rank=group_on_same_rank,
-            verbose=self.log_args.verbose,
-        )
-        # Initialize the training-side reward buffer.
-        self.reward_buffer = RewardBuffer(
-            self.reward_processor,
-            self.training_args.group_size,
-        )
+        self.reward_processor: Optional[RewardProcessor] = None
+        self.reward_buffer: Optional[RewardBuffer] = None
+        self.advantage_processor: Optional[AdvantageProcessor] = None
+
+        # Only runtime-feedback algorithms own training-side reward groups. Dataset
+        # acquisition intentionally leaves sampler_type="auto" because its official
+        # DistributedSampler has no reward-group layout to resolve.
+        if type(self).execution_contract.feedback is FeedbackMode.RUNTIME_REWARD:
+            sampler_layout = get_sampler_layout_contract(self.config.data_args.sampler_type)
+            group_on_same_rank = sampler_layout.groups_are_rank_local
+            async_groupwise_rewards = tuple(
+                name
+                for name, model in self.reward_models.items()
+                if isinstance(model, GroupwiseRewardModel)
+                and train_reward_configs[name].async_reward
+            )
+            if async_groupwise_rewards and not group_on_same_rank:
+                raise ValueError(
+                    "asynchronous groupwise rewards require a rank-local sampler layout; "
+                    f"sampler_type={self.config.data_args.sampler_type!r}, "
+                    f"groupwise_rewards={async_groupwise_rewards!r}"
+                )
+            self.reward_processor = RewardProcessor(
+                accelerator=self.accelerator,
+                reward_models=self.reward_models,
+                reward_configs=train_reward_configs,
+                tokenizer=self.adapter.tokenizer,  # For prompt encoding/decoding,
+                group_on_same_rank=group_on_same_rank,
+                verbose=self.log_args.verbose,
+            )
+            self.reward_buffer = RewardBuffer(
+                self.reward_processor,
+                self.training_args.group_size,
+            )
+
+            # `cfg.weight` is a Dict[str, float] after `_resolve_reward_weights`,
+            # so reward_weights is Dict[reward_name, Dict[dataset_name, float]].
+            self.advantage_processor = AdvantageProcessor(
+                accelerator=self.accelerator,
+                reward_weights={name: cfg.weight for name, cfg in train_reward_configs.items()},
+                group_size=self.training_args.group_size,
+                global_std=getattr(self.training_args, "global_std", True),
+                sampler_type=self.config.data_args.sampler_type,
+                verbose=self.log_args.verbose,
+                source_id_to_name=self.config.data_args.source_id_to_name,
+            )
 
         # Per-eval-dataset reward processors and buffers.  Eval is now
         # always per-dataset (the legacy single `eval_reward_buffer`
@@ -786,7 +1032,9 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                         reward_models=ds_models,
                         reward_configs=ds_configs,
                         tokenizer=self.adapter.tokenizer,
-                        group_on_same_rank=group_on_same_rank,
+                        # Evaluation currently computes pointwise rewards only and its
+                        # ordinary DataLoader is independent of the training sampler.
+                        group_on_same_rank=False,
                         verbose=self.log_args.verbose,
                     )
                     self.eval_dataset_reward_processors[ed.name] = ds_processor
@@ -794,19 +1042,6 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                         ds_processor,
                         self.training_args.group_size,
                     )
-
-        # Initialize advantage processor.
-        # `cfg.weight` is a Dict[str, float] after `_resolve_reward_weights`,
-        # so reward_weights is Dict[reward_name, Dict[dataset_name, float]].
-        self.advantage_processor = AdvantageProcessor(
-            accelerator=self.accelerator,
-            reward_weights={name: cfg.weight for name, cfg in train_reward_configs.items()},
-            group_size=self.training_args.group_size,
-            global_std=getattr(self.training_args, "global_std", True),
-            sampler_type=self.config.data_args.sampler_type,
-            verbose=self.log_args.verbose,
-            source_id_to_name=self.config.data_args.source_id_to_name,
-        )
 
         return self.reward_models, self.eval_reward_models
 
@@ -1514,11 +1749,768 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         Distillation accumulates several dataloader batches before a single
         optimizer step, so the grouping is a hook rather than a fixed sequence.
         """
+        cycle_started = time.monotonic()
+        rollout_started = cycle_started
         with self.sampling_context():
             samples = self.sample()
+        rollout_seconds = time.monotonic() - rollout_started
+        feedback_seconds = 0.0
         if type(self).execution_contract.feedback is FeedbackMode.RUNTIME_REWARD:
+            if getattr(self.training_args, "reward_optimization_overlap", False):
+                self._run_reward_optimization_overlap(
+                    samples,
+                    cycle_started=cycle_started,
+                    rollout_seconds=rollout_seconds,
+                )
+                return
+            feedback_started = time.monotonic()
             self.prepare_feedback(samples)
+            feedback_seconds = time.monotonic() - feedback_started
+        optimization_started = time.monotonic()
         self.optimize(samples)
+        optimization_seconds = time.monotonic() - optimization_started
+        metrics = self._critical_path_timing_metrics(
+            {
+                "timing/rollout_seconds": rollout_seconds,
+                "timing/feedback_seconds": feedback_seconds,
+                "timing/optimization_seconds": optimization_seconds,
+                "timing/cycle_seconds": time.monotonic() - cycle_started,
+            }
+        )
+        self.log_data(metrics, step=self.step)
+
+    def _critical_path_timing_metrics(
+        self,
+        metrics: Mapping[str, float],
+    ) -> Dict[str, float]:
+        """Reduce phase durations to rank-wise maxima for critical-path reporting."""
+        names = tuple(metrics)
+        if not names:
+            return {}
+        local = torch.tensor(
+            [float(metrics[name]) for name in names],
+            dtype=torch.float64,
+            device=self.accelerator.device,
+        )
+        if self.accelerator.num_processes > 1:
+            reduced = self.accelerator.reduce(local, reduction="max")
+            if reduced.shape != local.shape:
+                raise RuntimeError(
+                    "distributed timing reduction returned an invalid shape: "
+                    f"expected={tuple(local.shape)}, received={tuple(reduced.shape)}"
+                )
+            local = reduced
+        return {name: float(value) for name, value in zip(names, local.tolist())}
+
+    def _run_reward_optimization_overlap(
+        self,
+        samples: List[BaseSample],
+        *,
+        cycle_started: float,
+        rollout_seconds: float,
+    ) -> None:
+        """Consume globally ready reward tiles while the remaining rewards run."""
+        try:
+            plan = self._build_and_seal_reward_tile_plan(samples)
+        except Exception:
+            self.reward_buffer.abort_streaming()
+            raise
+
+        stream_started = time.monotonic()
+        feedback_seconds = 0.0
+        optimization_seconds = 0.0
+        optimization_started_while_rewards_pending_seconds = 0.0
+        reward_wait_seconds = 0.0
+        coordination_seconds = 0.0
+        first_tile_seconds: Optional[float] = None
+        out_of_order_tiles = 0
+        poll_count = 0
+        readiness_collective_elements = 0
+
+        overlap_context: Any = None
+        local_error: Optional[Exception] = None
+        preparation_started = time.monotonic()
+        try:
+            overlap_context = self._prepare_reward_optimization_overlap(samples, plan)
+        except Exception as error:
+            local_error = error
+        preparation_seconds = time.monotonic() - preparation_started
+        optimization_seconds += preparation_seconds
+        try:
+            self._synchronize_reward_overlap_error("optimizer preparation", local_error)
+        except Exception:
+            self._abort_reward_optimization_overlap(overlap_context)
+            self.reward_buffer.abort_streaming()
+            raise
+
+        pending = {tile.tile_id: tile for tile in plan.tiles}
+        tile_indices = {tile.tile_id: tile.sample_indices for tile in plan.tiles}
+        mode = self.training_args.reward_optimization_overlap_mode
+        poll_interval = self.training_args.reward_optimization_overlap_poll_interval
+        poll_delay = poll_interval
+        # Every unsuccessful poll is already a global synchronization point.
+        # Back off together while no work becomes runnable, then reset as soon
+        # as a tile advances. This bounds readiness latency without issuing a
+        # high-frequency all-reduce throughout a slow remote-reward request.
+        poll_delay_cap = max(poll_interval, min(1.0, poll_interval * 10.0))
+
+        try:
+            while pending:
+                coordination_started = time.monotonic()
+                poll_count += 1
+                local_error: Optional[Exception] = None
+                local_ready: Set[int] = set()
+                try:
+                    local_ready = self.reward_buffer.poll_ready_tiles(
+                        {tile_id: tile_indices[tile_id] for tile_id in pending}
+                    )
+                except Exception as error:
+                    local_error = error
+
+                readiness_candidates = self._reward_overlap_readiness_candidates(
+                    pending=set(pending),
+                    mode=mode,
+                )
+                if mode == "ordered":
+                    ready_values = [
+                        int(readiness_candidates[0] in local_ready),
+                        int(set(pending).issubset(local_ready)),
+                    ]
+                else:
+                    ready_values = [int(tile_id in local_ready) for tile_id in readiness_candidates]
+                ready_flags = torch.tensor(
+                    ready_values + [int(local_error is not None)],
+                    dtype=torch.int32,
+                    device=self.accelerator.device,
+                )
+                readiness_collective_elements += int(ready_flags.numel())
+                ready_counts = self.accelerator.reduce(ready_flags, reduction="sum")
+                if int(ready_counts[-1].item()) > 0:
+                    self._raise_reward_overlap_errors("reward polling", local_error)
+                globally_ready = {
+                    tile_id
+                    for tile_id, count in zip(
+                        readiness_candidates,
+                        ready_counts[: len(readiness_candidates)].tolist(),
+                    )
+                    if count == self.accelerator.num_processes
+                }
+                all_rewards_ready = (
+                    int(ready_counts[1].item()) == self.accelerator.num_processes
+                    if mode == "ordered"
+                    else len(globally_ready) == len(pending)
+                )
+                coordination_seconds += time.monotonic() - coordination_started
+
+                next_ordered = min(pending)
+                selected = self._select_reward_overlap_tile(
+                    pending=set(pending),
+                    globally_ready=globally_ready,
+                    mode=mode,
+                )
+                if selected is None:
+                    wait_started = time.monotonic()
+                    time.sleep(poll_delay)
+                    reward_wait_seconds += time.monotonic() - wait_started
+                    poll_delay = min(poll_delay * 2.0, poll_delay_cap)
+                    continue
+
+                poll_delay = poll_interval
+                if first_tile_seconds is None:
+                    first_tile_seconds = time.monotonic() - stream_started
+                if selected != next_ordered:
+                    out_of_order_tiles += 1
+                tile = pending.pop(selected)
+                tile_samples = plan.samples_for(tile, samples)
+
+                feedback_started = time.monotonic()
+                self._resolve_reward_overlap_tile_feedback(
+                    tile,
+                    tile_samples,
+                )
+                feedback_seconds += time.monotonic() - feedback_started
+                rewards_remain_pending = not all_rewards_ready
+                optimization_started = time.monotonic()
+                self._optimize_reward_overlap_tile(tile, tile_samples, overlap_context)
+                tile_optimization_seconds = time.monotonic() - optimization_started
+                optimization_seconds += tile_optimization_seconds
+                if rewards_remain_pending:
+                    optimization_started_while_rewards_pending_seconds += tile_optimization_seconds
+
+            feedback_started = time.monotonic()
+            full_rewards = self._finish_reward_overlap_stream()
+            self._compute_synchronized_reward_overlap_advantages(
+                samples,
+                full_rewards,
+                phase="final advantage",
+                build_metrics=True,
+                collected_layout=self._reward_overlap_acquisition_group_layout,
+            )
+            feedback_seconds += time.monotonic() - feedback_started
+            finalization_started = time.monotonic()
+            final_metrics = self._finalize_reward_optimization_overlap(
+                overlap_context,
+                samples,
+            )
+            optimization_seconds += time.monotonic() - finalization_started
+            stream_seconds = time.monotonic() - stream_started
+            timing_metrics = self._critical_path_timing_metrics(
+                {
+                    "timing/rollout_seconds": rollout_seconds,
+                    "timing/feedback_seconds": feedback_seconds,
+                    "timing/optimization_seconds": optimization_seconds,
+                    "timing/cycle_seconds": time.monotonic() - cycle_started,
+                    "timing/reward_overlap/stream_seconds": stream_seconds,
+                    "timing/reward_overlap/wait_seconds": reward_wait_seconds,
+                    "timing/reward_overlap/coordination_seconds": coordination_seconds,
+                    "timing/reward_overlap/preparation_seconds": preparation_seconds,
+                    "timing/reward_overlap/first_tile_seconds": first_tile_seconds or 0.0,
+                    "timing/reward_overlap/optimization_started_while_rewards_pending_seconds": (
+                        optimization_started_while_rewards_pending_seconds
+                    ),
+                }
+            )
+            critical_optimization_seconds = timing_metrics["timing/optimization_seconds"]
+            pending_at_start_optimization_seconds = timing_metrics[
+                "timing/reward_overlap/optimization_started_while_rewards_pending_seconds"
+            ]
+            timing_metrics.update(
+                {
+                    "timing/reward_overlap/rollout_seconds": timing_metrics[
+                        "timing/rollout_seconds"
+                    ],
+                    "timing/reward_overlap/optimization_seconds": critical_optimization_seconds,
+                    "timing/reward_overlap/optimization_started_after_rewards_ready_seconds": max(
+                        0.0,
+                        critical_optimization_seconds - pending_at_start_optimization_seconds,
+                    ),
+                    "timing/reward_overlap/optimization_started_while_rewards_pending_ratio": (
+                        pending_at_start_optimization_seconds / critical_optimization_seconds
+                        if critical_optimization_seconds > 0
+                        else 0.0
+                    ),
+                }
+            )
+            metrics = self.advantage_processor.pop_advantage_metrics()
+            metrics.update(final_metrics)
+            metrics.update(timing_metrics)
+            metrics.update(
+                {
+                    "train/reward_overlap/tile_count": len(plan.tiles),
+                    "train/reward_overlap/samples_per_tile": plan.samples_per_tile,
+                    "train/reward_overlap/poll_count": poll_count,
+                    "train/reward_overlap/readiness_collective_elements": (
+                        readiness_collective_elements
+                    ),
+                    "train/reward_overlap/out_of_order_tiles": out_of_order_tiles,
+                    "train/reward_overlap/reused_group_metadata_batches": sum(
+                        len(group_infos)
+                        for group_infos in self._reward_overlap_group_infos_by_tile.values()
+                    ),
+                }
+            )
+            self.log_data(metrics, step=self.step)
+        except Exception:
+            self._abort_reward_optimization_overlap(overlap_context)
+            self.reward_buffer.abort_streaming()
+            raise
+
+    def _finish_reward_overlap_stream(self) -> Dict[str, torch.Tensor]:
+        """Finish every reward future behind a synchronized rank-local error guard."""
+        rewards: Dict[str, torch.Tensor] = {}
+        local_error: Optional[Exception] = None
+        try:
+            rewards = self.reward_buffer.finish_streaming()
+        except Exception as error:
+            local_error = error
+        self._synchronize_reward_overlap_error("reward cycle finish", local_error)
+        return rewards
+
+    def _prepare_reward_optimization_overlap(
+        self,
+        samples: List[BaseSample],
+        plan: RewardTilePlan,
+    ) -> Any:
+        """Prepare objective-owned immutable replay state while rewards run."""
+        del samples, plan
+        return None
+
+    def _optimize_reward_overlap_tile(
+        self,
+        tile: RewardTile,
+        samples: List[BaseSample],
+        context: Any,
+    ) -> None:
+        """Optimize one globally selected reward-complete tile."""
+        del tile, context
+        self.optimize(samples)
+
+    def _finalize_reward_optimization_overlap(
+        self,
+        context: Any,
+        samples: List[BaseSample],
+    ) -> Mapping[str, Any]:
+        """Finish objective-owned state after every reward tile was consumed."""
+        del context, samples
+        return {}
+
+    def _abort_reward_optimization_overlap(self, context: Any) -> None:
+        """Release objective-owned overlap state after a failed cycle."""
+        del context
+
+    @staticmethod
+    def _reward_overlap_readiness_candidates(
+        *,
+        pending: Set[int],
+        mode: Literal["ordered", "ready"],
+    ) -> Tuple[int, ...]:
+        """Return tile ids whose individual readiness must cross ranks.
+
+        Ordered execution only needs the head tile. A second scalar in the
+        caller records whether *all* pending rewards are ready so overlap timing
+        remains exact without communicating one flag per tile.
+        """
+        if not pending:
+            return ()
+        if mode == "ordered":
+            return (min(pending),)
+        if mode == "ready":
+            return tuple(sorted(pending))
+        raise ValueError(f"unsupported reward overlap mode: {mode!r}")
+
+    @staticmethod
+    def _select_reward_overlap_tile(
+        *,
+        pending: Set[int],
+        globally_ready: Set[int],
+        mode: Literal["ordered", "ready"],
+    ) -> Optional[int]:
+        """Select the same reward tile on every rank from global readiness.
+
+        ``ordered`` preserves tile order and therefore lets the oldest pending tile
+        gate progress. ``ready`` permits a later tile to bypass that straggler. The
+        minimum ready id is still selected to keep the choice deterministic across
+        ranks; this does not impose completion order on the reward workers.
+        """
+        if not pending:
+            return None
+        globally_ready = pending.intersection(globally_ready)
+        if mode == "ordered":
+            next_ordered = min(pending)
+            return next_ordered if next_ordered in globally_ready else None
+        if mode == "ready":
+            return min(globally_ready) if globally_ready else None
+        raise ValueError(f"unsupported reward overlap mode: {mode!r}")
+
+    def _build_and_seal_reward_tile_plan(
+        self,
+        samples: List[BaseSample],
+    ) -> RewardTilePlan:
+        """Build rank-local geometry and fail every rank before streaming starts."""
+        plan: Optional[RewardTilePlan] = None
+        local_error: Optional[Exception] = None
+        try:
+            geometry = self.reward_optimization_overlap_geometry(self.config)
+            plan = build_reward_tile_plan(
+                samples,
+                group_size=self.training_args.group_size,
+                per_device_batch_size=self.training_args.per_device_batch_size,
+                gradient_accumulation_steps=self.training_args.gradient_accumulation_steps,
+                optimizer_terms_per_batch=geometry.optimizer_terms_per_batch,
+                group_layout=geometry.group_layout,
+                optimizer_examples_per_group=geometry.optimizer_examples_per_group,
+                accumulation_scope=geometry.accumulation_scope,
+                manifest=self._reward_overlap_acquisition_manifest,
+                num_replicas=self.accelerator.num_processes,
+            )
+            self._validate_reward_overlap_replay_batch_composition(plan, samples)
+        except Exception as error:
+            local_error = error
+        self._synchronize_reward_overlap_error("tile plan construction", local_error)
+        if plan is None:  # pragma: no cover - synchronized failure above always raises
+            raise RuntimeError("reward tile plan construction returned no plan")
+
+        self._validate_distributed_reward_tile_plan(plan, samples)
+
+        local_error = None
+        try:
+            if (
+                plan.geometry.group_layout != "rank_local"
+                and self.reward_buffer.has_async_groupwise_rewards
+            ):
+                raise ValueError(
+                    "cross-rank reward overlap currently supports async pointwise rewards "
+                    "only; an async groupwise reward needs a complete group on one rank"
+                )
+            self.reward_buffer.seal_for_streaming()
+        except Exception as error:
+            local_error = error
+        self._synchronize_reward_overlap_error("reward buffer sealing", local_error)
+        return plan
+
+    def _validate_reward_overlap_replay_batch_composition(
+        self,
+        plan: RewardTilePlan,
+        samples: List[BaseSample],
+    ) -> None:
+        """Keep every pack-dependent rollout micro-batch intact during replay.
+
+        Most adapters are invariant to the other samples in a micro-batch. Some,
+        notably Bagel's NaViT-packed forward, are not: changing a pack changes the
+        bf16 projection rounding for every member. For those adapters the base
+        generation loop records object identities at each rollout boundary. This
+        validator proves that tiled replay uses the same samples, order, and
+        boundaries before reward streaming or optimization begins.
+        """
+        if not self.adapter.requires_preserved_replay_batch_composition:
+            return
+
+        if (
+            plan.geometry.optimizer_examples_per_group is not None
+            and plan.geometry.optimizer_examples_per_group != self.training_args.group_size
+        ):
+            raise ValueError(
+                "pack-composition-dependent adapters cannot use reward overlap when the "
+                "objective transforms each reward group into a different number of replay "
+                "examples"
+            )
+
+        manifest = plan.manifest
+        if manifest is None or not manifest.rollout_batches:
+            raise RuntimeError(
+                "reward overlap for a pack-composition-dependent adapter requires rollout "
+                "micro-batch metadata; custom generate_samples() implementations must "
+                "record the base generation-loop batch boundaries"
+            )
+
+        batch_size = self.training_args.per_device_batch_size
+        invalid_sizes = tuple(
+            len(batch) for batch in manifest.rollout_batches if len(batch) != batch_size
+        )
+        if invalid_sizes:
+            raise ValueError(
+                "pack-composition-dependent replay requires every rollout micro-batch to "
+                f"match train.per_device_batch_size={batch_size}; invalid_sizes={invalid_sizes!r}"
+            )
+
+        manifest.validate_samples(samples)
+        boundaries = manifest.rollout_boundaries
+        for tile in plan.tiles:
+            if tile.start not in boundaries or tile.stop not in boundaries:
+                raise ValueError(
+                    "reward tile splits a pack-composition-dependent rollout micro-batch: "
+                    f"tile_id={tile.tile_id}, range=({tile.start}, {tile.stop}), "
+                    f"rollout_boundaries={tuple(sorted(boundaries))!r}"
+                )
+            replay_batch_count = tile.sample_count // batch_size
+            if replay_batch_count != plan.batches_per_tile:
+                raise ValueError(
+                    "reward tile would change pack-composition-dependent replay batches: "
+                    f"tile_id={tile.tile_id}, replay_batches={replay_batch_count}, "
+                    f"planned_optimizer_batches={plan.batches_per_tile}"
+                )
+
+    def _validate_distributed_reward_tile_plan(
+        self,
+        plan: RewardTilePlan,
+        samples: List[BaseSample],
+    ) -> None:
+        """Require rank-uniform geometry and complete global cross-rank groups."""
+        cross_rank_groups = plan.geometry.group_layout in {
+            "cross_rank_sharded",
+            "cross_rank_tiled",
+        }
+        group_layout_code = {
+            "rank_local": 0,
+            "cross_rank_sharded": 1,
+            "cross_rank_tiled": 2,
+        }[plan.geometry.group_layout]
+        local_header = torch.tensor(
+            [
+                len(plan.tiles),
+                plan.samples_per_tile,
+                plan.batches_per_tile,
+                plan.sample_count,
+                len(samples),
+                group_layout_code,
+            ],
+            dtype=torch.int64,
+            device=self.accelerator.device,
+        )
+        self._reward_overlap_group_infos_by_tile: Dict[int, Tuple[_RewardOverlapGroupInfo, ...]] = (
+            {}
+        )
+        self._reward_overlap_group_layouts_by_tile: Dict[int, CollectedGroupLayout] = {}
+        self._reward_overlap_acquisition_group_layout: Optional[CollectedGroupLayout] = None
+
+        if self.accelerator.num_processes > 1:
+            gathered_headers = self.accelerator.gather(local_header)
+        else:
+            gathered_headers = local_header
+        expected_header_values = self.accelerator.num_processes * int(local_header.numel())
+        if int(gathered_headers.numel()) != expected_header_values:
+            raise RuntimeError(
+                "distributed reward tile header validation returned an invalid cardinality: "
+                f"expected={expected_header_values}, received={gathered_headers.numel()}"
+            )
+        gathered_headers = gathered_headers.reshape(self.accelerator.num_processes, -1).cpu()
+        if not torch.equal(
+            gathered_headers,
+            gathered_headers[0].expand_as(gathered_headers),
+        ):
+            raise RuntimeError(
+                "reward tile geometry differs across ranks: "
+                "(tile_count, samples_per_tile, batches_per_tile, plan_sample_count, "
+                "local_sample_count, group_layout_code)="
+                f"{gathered_headers.tolist()!r}"
+            )
+        if not torch.equal(gathered_headers[:, 3], gathered_headers[:, 4]):
+            raise RuntimeError(
+                "reward tile plan sample count differs from the local sample count: "
+                f"headers={gathered_headers.tolist()!r}"
+            )
+        if not cross_rank_groups:
+            return
+
+        local_group_identities: Optional[torch.Tensor] = None
+        local_error: Optional[Exception] = None
+        try:
+            local_group_identities = torch.as_tensor(
+                group_identity_rows(samples),
+                dtype=torch.int64,
+                device=self.accelerator.device,
+            )
+        except Exception as error:
+            local_error = error
+        self._synchronize_reward_overlap_error("tile UID preparation", local_error)
+        if local_group_identities is None:  # pragma: no cover - synchronized failure above
+            raise RuntimeError("reward tile UID preparation returned no payload")
+        if self.accelerator.num_processes > 1:
+            gathered_identities = self.accelerator.gather(local_group_identities)
+        else:
+            gathered_identities = local_group_identities
+        expected_identity_values = self.accelerator.num_processes * plan.sample_count * 2
+        if int(gathered_identities.numel()) != expected_identity_values:
+            raise RuntimeError(
+                "distributed reward identity validation returned an invalid cardinality: "
+                f"expected={expected_identity_values}, received={gathered_identities.numel()}"
+            )
+        gathered_identities = gathered_identities.reshape(
+            self.accelerator.num_processes,
+            plan.sample_count,
+            2,
+        )
+
+        def collected_layout(start: int, stop: int) -> CollectedGroupLayout:
+            identities = gathered_identities[:, start:stop].reshape(-1, 2)
+            _unique, inverse = torch.unique(
+                identities,
+                dim=0,
+                sorted=True,
+                return_inverse=True,
+            )
+            return CollectedGroupLayout(
+                group_indices=inverse.cpu().numpy(),
+                source_ids=identities[:, 0].cpu().numpy(),
+                local_sample_count=stop - start,
+                num_processes=self.accelerator.num_processes,
+            )
+
+        self._reward_overlap_acquisition_group_layout = collected_layout(
+            0,
+            plan.sample_count,
+        )
+        self._reward_overlap_group_layouts_by_tile = {
+            tile.tile_id: collected_layout(tile.start, tile.stop) for tile in plan.tiles
+        }
+        seen_groups: Set[Tuple[int, int]] = set()
+        batch_size = self.training_args.per_device_batch_size
+        for tile in plan.tiles:
+            tile_group_infos: List[_RewardOverlapGroupInfo] = []
+            if plan.geometry.group_layout == "cross_rank_tiled":
+                tile_identities = gathered_identities[:, tile.start : tile.stop].reshape(-1, 2)
+                unique_identities, counts = torch.unique(
+                    tile_identities,
+                    dim=0,
+                    sorted=True,
+                    return_counts=True,
+                )
+                expected_counts = torch.full_like(counts, self.training_args.group_size)
+                if not torch.equal(counts, expected_counts):
+                    raise ValueError(
+                        "cross-rank tiled reward work unit does not contain complete "
+                        f"global groups: tile_id={tile.tile_id}, "
+                        f"identities={unique_identities.tolist()}, counts={counts.tolist()}, "
+                        f"group_size={self.training_args.group_size}"
+                    )
+                tile_groups = {tuple(identity) for identity in unique_identities.tolist()}
+                repeated = seen_groups.intersection(tile_groups)
+                if repeated:
+                    raise ValueError(
+                        "cross-rank tiled reward groups must belong to exactly one work "
+                        f"unit; tile_id={tile.tile_id}, "
+                        f"repeated_group_identities={sorted(repeated)!r}"
+                    )
+                seen_groups.update(tile_groups)
+                self._reward_overlap_group_infos_by_tile[tile.tile_id] = ()
+                continue
+            for batch_start in range(tile.start, tile.stop, batch_size):
+                batch_stop = min(batch_start + batch_size, tile.stop)
+                batch_identities = gathered_identities[:, batch_start:batch_stop].reshape(-1, 2)
+                unique_identities, inverse, counts = torch.unique(
+                    batch_identities,
+                    dim=0,
+                    sorted=True,
+                    return_inverse=True,
+                    return_counts=True,
+                )
+                expected_counts = torch.full_like(counts, self.training_args.group_size)
+                if not torch.equal(counts, expected_counts):
+                    raise ValueError(
+                        "cross-rank reward optimizer batch does not contain complete "
+                        f"global groups: tile_id={tile.tile_id}, "
+                        f"batch_start={batch_start}, identities={unique_identities.tolist()}, "
+                        f"counts={counts.tolist()}, group_size={self.training_args.group_size}"
+                    )
+                batch_groups = {tuple(identity) for identity in unique_identities.tolist()}
+                repeated = seen_groups.intersection(batch_groups)
+                if repeated:
+                    raise ValueError(
+                        "cross-rank reward groups must belong to exactly one optimizer "
+                        f"batch; tile_id={tile.tile_id}, batch_start={batch_start}, "
+                        f"repeated_group_identities={sorted(repeated)!r}"
+                    )
+                seen_groups.update(batch_groups)
+                local_batch_identities = gathered_identities[
+                    self.accelerator.process_index,
+                    batch_start:batch_stop,
+                ]
+                local_batch_size = batch_stop - batch_start
+                local_group_indices = inverse.reshape(
+                    self.accelerator.num_processes,
+                    local_batch_size,
+                )[self.accelerator.process_index]
+                tile_group_infos.append(
+                    _RewardOverlapGroupInfo(
+                        local_group_identities=local_batch_identities.clone(),
+                        local_group_indices=local_group_indices.clone(),
+                        num_groups=int(unique_identities.shape[0]),
+                    )
+                )
+            self._reward_overlap_group_infos_by_tile[tile.tile_id] = tuple(tile_group_infos)
+
+    def _reward_overlap_group_infos_for_tile(
+        self,
+        tile_id: int,
+    ) -> Tuple[_RewardOverlapGroupInfo, ...]:
+        """Return cached cross-rank group mappings for one overlap tile."""
+        group_infos = self._reward_overlap_group_infos_by_tile.get(tile_id)
+        if group_infos is None:
+            raise RuntimeError(
+                "reward overlap cross-rank group metadata is unavailable for " f"tile_id={tile_id}"
+            )
+        return group_infos
+
+    def _resolve_reward_overlap_tile_feedback(
+        self,
+        tile: RewardTile,
+        samples: List[BaseSample],
+    ) -> None:
+        """Resolve one tile before any rank enters advantage collectives."""
+        rewards: Dict[str, torch.Tensor] = {}
+        local_error: Optional[Exception] = None
+        try:
+            rewards = self.reward_buffer.resolve_streaming_tile(tile.sample_indices)
+        except Exception as error:
+            local_error = error
+        self._synchronize_reward_overlap_error("tile reward resolution", local_error)
+        self._compute_synchronized_reward_overlap_advantages(
+            samples,
+            rewards,
+            phase="tile advantage",
+            build_metrics=False,
+            collected_layout=self._reward_overlap_group_layouts_by_tile.get(tile.tile_id),
+        )
+
+    def _compute_synchronized_reward_overlap_advantages(
+        self,
+        samples: List[BaseSample],
+        rewards: Dict[str, torch.Tensor],
+        *,
+        phase: str,
+        build_metrics: bool,
+        collected_layout: Optional[CollectedGroupLayout] = None,
+    ) -> None:
+        """Guard local packing before cross-rank advantage collectives."""
+        prepared_collection = None
+        local_error: Optional[Exception] = None
+        try:
+            prepared_collection = self.advantage_processor.prepare_group_reward_collection(
+                samples,
+                rewards,
+                require_all_rewards=True,
+                collected_layout=collected_layout,
+            )
+        except Exception as error:
+            local_error = error
+        self._synchronize_reward_overlap_error(f"{phase} preparation", local_error)
+
+        local_error = None
+        try:
+            self._compute_reward_overlap_advantages(
+                samples,
+                rewards,
+                build_metrics=build_metrics,
+                prepared_collection=prepared_collection,
+            )
+        except Exception as error:
+            local_error = error
+        self._synchronize_reward_overlap_error(f"{phase} computation", local_error)
+
+    def _synchronize_reward_overlap_error(
+        self,
+        phase: str,
+        error: Optional[Exception],
+    ) -> None:
+        """Propagate a rank-local reward error before peers enter optimizer collectives."""
+        if self.accelerator.num_processes <= 1:
+            if error is not None:
+                raise error
+            return
+        local_failure = torch.tensor(
+            [int(error is not None)],
+            dtype=torch.int32,
+            device=self.accelerator.device,
+        )
+        failure_count = self.accelerator.reduce(local_failure, reduction="sum")
+        if int(failure_count.item()) == 0:
+            return
+        self._raise_reward_overlap_errors(phase, error)
+
+    def _raise_reward_overlap_errors(
+        self,
+        phase: str,
+        error: Optional[Exception],
+    ) -> None:
+        """Gather details after a distributed failure flag is already known."""
+        payload = (
+            None
+            if error is None
+            else {
+                "rank": self.accelerator.process_index,
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+        )
+        if self.accelerator.num_processes <= 1:
+            if error is not None:
+                raise error
+            raise RuntimeError(f"reward optimization overlap {phase} failed")
+        failures = tuple(item for item in gather_object([payload]) if item is not None)
+        message = f"reward optimization overlap {phase} failed across ranks: {failures!r}"
+        if error is not None:
+            raise RuntimeError(message) from error
+        raise RuntimeError(message)
 
     @contextmanager
     def sampling_context(self) -> Iterator[None]:
@@ -1566,7 +2558,6 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             store_to_samples: Whether to write advantages back onto each sample.
             aggregation_func: Within-group aggregation, defaulting to the
                 configured ``advantage_aggregation``.
-
         Returns:
             One advantage per sample.
         """
@@ -1576,6 +2567,24 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             rewards=rewards,
             store_to_samples=store_to_samples,
             aggregation_func=aggregation_func,
+        )
+
+    def _compute_reward_overlap_advantages(
+        self,
+        samples: List[BaseSample],
+        rewards: Dict[str, torch.Tensor],
+        *,
+        build_metrics: bool,
+        prepared_collection: Any = None,
+    ) -> torch.Tensor:
+        """Compute tile or acquisition advantages without changing the public API."""
+        return self.advantage_processor._compute_advantages(
+            samples=samples,
+            rewards=rewards,
+            store_to_samples=True,
+            aggregation_func=self.training_args.advantage_aggregation,
+            build_metrics=build_metrics,
+            prepared_collection=prepared_collection,
         )
 
     def optimize(self, *args: Any, **kwargs: Any) -> None:
@@ -2011,6 +3020,12 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             )
 
         self.adapter.rollout()
+        capture_overlap_manifest = bool(
+            reward_buffer is not None
+            and getattr(self.training_args, "reward_optimization_overlap", False)
+        )
+        recorded_rollout_batches: List[Tuple[int, ...]] = []
+        self._reward_overlap_acquisition_manifest = None
         if reward_buffer is not None:
             reward_buffer.clear()
 
@@ -2041,7 +3056,15 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                     trajectory_indices=trajectory_indices,
                     **extra_inference_kwargs,
                 )
+                if capture_overlap_manifest:
+                    recorded_rollout_batches.append(tuple(id(sample) for sample in sample_batch))
                 samples.extend(sample_batch)
+
+        if capture_overlap_manifest:
+            self._reward_overlap_acquisition_manifest = AcquisitionManifest.from_samples(
+                samples,
+                rollout_batch_object_ids=recorded_rollout_batches,
+            )
 
         # Multi-source invariant: when more than one training source is
         # active, batches flow through `MultiSourceTrainDataLoader`, which

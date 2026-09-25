@@ -60,6 +60,23 @@ rates, geometry, and batching.
 exhaustion; offline output media is decoded and encoded on the fly, while only prompt/input
 conditions enter the preprocessing cache.
 
+Generated runtime-feedback trainers may separately declare a
+`RewardOptimizationOverlapContract`. `BaseTrainer` then seals the async `RewardBuffer`, builds
+optimizer work units from the algorithm's rank-local, global-batch, or global-tile geometry,
+intersects readiness across ranks, and invokes internal prepare/tile/finalize lifecycle hooks
+without changing the public `sample`/`prepare_feedback`/`optimize` API. `SamplerLayoutContract`
+owns where complete groups become available; `SamplerSelectionContract` declares what an
+algorithm can consume; `FeedbackReducerContract` declares whether reward-to-advantage reduction
+needs acquisition-wide statistics. Reward-model request batching remains independent of optimizer
+work-unit boundaries. An `AcquisitionManifest` preserves canonical `(source_id, unique_id)`
+identity and original rollout microbatch boundaries for pack-composition-dependent adapters such
+as Bagel. Rank-local objectives close groups and GAS per work unit; TDM-R1 may close one role
+accumulation window across all work units. This capability does not change `ExecutionContract`;
+dataset and no-feedback compositions remain structurally bypassed.
+Generated cycles also publish distributed critical-path timings from `BaseTrainer`: generic stage
+durations use the top-level `timing/` namespace, streamed-reward diagnostics use
+`timing/reward_overlap/`, and algorithm loss/reward metrics remain under `train/`.
+
 Exact runtime identity is built from realized prepared state. It locks optimizer/model/backend
 semantics, the checkpoint-realized pipeline I/O contract, ordered training data, and the complete
 replayed evaluation path (cadence, arguments,
@@ -292,7 +309,7 @@ Details: `topics/component_variants.md`.
 ### Reward Processing
 `RewardProcessor` dispatches by model type:
 - **Pointwise**: applicable sub-batches of at most `batch_size`
-- **Groupwise**: group by `unique_id` (local or distributed path)
+- **Groupwise**: group by canonical `(source_id, unique_id)` identity (local or distributed path)
 - **Multi-reward**: weighted aggregation
 - **Async**: optional non-blocking computation
 

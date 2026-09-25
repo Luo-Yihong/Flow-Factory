@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, Mapping, Optional, Tuple, Union
 
@@ -23,6 +24,10 @@ from ...contracts.execution import (
     ONLINE_EXECUTION_CONTRACT,
     AcquisitionMode,
     ExecutionContract,
+)
+from ...contracts.sampler import (
+    FLEXIBLE_SAMPLER_SELECTION,
+    SamplerSelectionContract,
 )
 from ...utils.dist import get_world_size
 from ...utils.logger_utils import setup_logger
@@ -128,6 +133,12 @@ class TrainingArguments(ArgABC):
     r"""Base training arguments shared across all algorithms."""
 
     execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
+    sampler_selection_contract: ClassVar[SamplerSelectionContract] = FLEXIBLE_SAMPLER_SELECTION
+
+    def get_sampler_selection_contract(self) -> SamplerSelectionContract:
+        """Return the algorithm's sampler requirement for this configuration."""
+
+        return type(self).sampler_selection_contract
 
     # --- Trainer type ---
     trainer_type: str = field(
@@ -319,8 +330,59 @@ class TrainingArguments(ArgABC):
             )
         },
     )
+    reward_optimization_overlap: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Overlap asynchronous runtime rewards with optimization of complete "
+                "reward tiles. Supported trainers validate the required "
+                "sampler, advantage, and replay-order constraints before model loading."
+            )
+        },
+    )
+    reward_optimization_overlap_mode: Literal["ordered", "ready"] = field(
+        default="ready",
+        metadata={
+            "help": (
+                "Tile scheduling for reward/optimization overlap. 'ordered' preserves "
+                "rollout order; 'ready' consumes the lowest globally ready tile and may "
+                "change optimizer order according to reward latency."
+            )
+        },
+    )
+    reward_optimization_overlap_poll_interval: float = field(
+        default=0.05,
+        metadata={
+            "help": (
+                "Initial seconds between distributed reward-readiness polls. "
+                "Globally idle polls back off together and reset after progress."
+            )
+        },
+    )
 
     def __post_init__(self):
+        if type(self.reward_optimization_overlap) is not bool:
+            raise TypeError(
+                "reward_optimization_overlap must be bool, received "
+                f"{type(self.reward_optimization_overlap).__name__}: "
+                f"{self.reward_optimization_overlap!r}"
+            )
+        if self.reward_optimization_overlap_mode not in {"ordered", "ready"}:
+            raise ValueError(
+                "reward_optimization_overlap_mode must be 'ordered' or 'ready', received "
+                f"{self.reward_optimization_overlap_mode!r}"
+            )
+        self.reward_optimization_overlap_poll_interval = float(
+            self.reward_optimization_overlap_poll_interval
+        )
+        if (
+            not math.isfinite(self.reward_optimization_overlap_poll_interval)
+            or self.reward_optimization_overlap_poll_interval <= 0
+        ):
+            raise ValueError(
+                "reward_optimization_overlap_poll_interval must be finite and > 0, received "
+                f"{self.reward_optimization_overlap_poll_interval}"
+            )
         self.enable_gradient_checkpointing = normalize_gradient_checkpointing_policy(
             self.enable_gradient_checkpointing
         )
