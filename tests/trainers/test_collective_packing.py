@@ -7,7 +7,11 @@ import torch
 import flow_factory.utils.dist as dist_utils
 from flow_factory.advantage import AdvantageProcessor, CollectedGroupLayout
 from flow_factory.samples import BaseSample, MiniMaxH3Ref2VASample
-from flow_factory.utils.dist import gather_aligned_floating_tensors, gather_samples
+from flow_factory.utils.dist import (
+    _gather_field_values,
+    gather_aligned_floating_tensors,
+    gather_samples,
+)
 
 
 class GatherRecorder:
@@ -19,6 +23,40 @@ class GatherRecorder:
     def gather(self, tensor: torch.Tensor) -> torch.Tensor:
         self.calls.append(tensor.detach().clone())
         return torch.cat((tensor, tensor), dim=0)
+
+
+def test_rank_local_nested_tensor_fields_do_not_enter_a_global_collective(monkeypatch):
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        gather=lambda _tensor: (_ for _ in ()).throw(
+            AssertionError("rank-local fields must not use accelerator.gather")
+        ),
+    )
+    coordinator = SimpleNamespace(groups_are_rank_local=True)
+    monkeypatch.setattr(
+        dist_utils.dist,
+        "all_gather",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rank-local fields must not use torch.distributed.all_gather")
+        ),
+    )
+    values = [
+        [torch.tensor([1.0]), torch.tensor([2.0, 3.0])],
+        [torch.tensor([4.0])],
+    ]
+
+    gathered = _gather_field_values(
+        accelerator,
+        values,
+        torch.device("cpu"),
+        group_coordinator=coordinator,
+    )
+
+    assert gathered is not values
+    assert [[tensor.tolist() for tensor in item] for item in gathered] == [
+        [[1.0], [2.0, 3.0]],
+        [[4.0]],
+    ]
 
 
 def test_aligned_floating_tensors_use_one_gather_and_round_trip_named_columns():
@@ -105,8 +143,10 @@ def test_gather_samples_packs_same_dtype_fields_and_preserves_other_fields():
     )
 
     assert len(accelerator.calls) == 2
-    assert accelerator.calls[0].shape == (2, 4)
-    assert accelerator.calls[1].shape == (2, 3)
+    assert accelerator.calls[0].shape == (2, 3)
+    assert accelerator.calls[0].dtype == torch.int64
+    assert accelerator.calls[1].shape == (2, 4)
+    assert accelerator.calls[1].dtype == torch.float32
     assert len(gathered) == 4
     torch.testing.assert_close(gathered[0].prompt_embeds, samples[0].prompt_embeds)
     torch.testing.assert_close(
@@ -115,20 +155,59 @@ def test_gather_samples_packs_same_dtype_fields_and_preserves_other_fields():
     torch.testing.assert_close(gathered[2].prompt_ids, samples[0].prompt_ids)
 
 
-def test_gather_samples_preserves_concrete_reconstruction_fields() -> None:
+def test_gather_samples_preserves_concrete_reconstruction_fields(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dist_utils,
+        "gather_object",
+        lambda _values: (_ for _ in ()).throw(
+            AssertionError("annotated string fields must use tensor collectives")
+        ),
+    )
     accelerator = GatherRecorder()
     manifest = '[{"path":"condition.png","type":"image"}]'
     sample = MiniMaxH3Ref2VASample(
-        prompt="A reference-conditioned prompt",
+        prompt="参考图像 prompt 🌏",
         reference_manifest=manifest,
     )
 
     gathered = gather_samples(accelerator, [sample], ["prompt"])
 
-    assert len(gathered) == 1
-    assert isinstance(gathered[0], MiniMaxH3Ref2VASample)
-    assert gathered[0].prompt == sample.prompt
-    assert gathered[0].reference_manifest == manifest
+    assert len(accelerator.calls) == 2
+    assert accelerator.calls[0].dtype == torch.int64
+    assert accelerator.calls[1].dtype == torch.uint8
+    assert len(gathered) == 2
+    assert all(isinstance(item, MiniMaxH3Ref2VASample) for item in gathered)
+    assert [item.prompt for item in gathered] == [sample.prompt, sample.prompt]
+    assert [item.reference_manifest for item in gathered] == [manifest, manifest]
+
+
+def test_gather_samples_can_select_extra_fields_without_pickle(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dist_utils,
+        "gather_object",
+        lambda _values: (_ for _ in ()).throw(
+            AssertionError("selected tensor extras must not use pickle collectives")
+        ),
+    )
+    accelerator = GatherRecorder()
+    sample = BaseSample(
+        prompt_ids=torch.tensor([1, 2, 3]),
+        extra_kwargs={
+            "advantage": torch.tensor(0.5),
+            "rewards": {"ocr": torch.tensor(1.0)},
+        },
+    )
+
+    gathered = gather_samples(
+        accelerator,
+        [sample],
+        ["prompt_ids"],
+        extra_field_names=["advantage"],
+    )
+
+    assert len(gathered) == 2
+    assert all(set(item.extra_kwargs) == {"advantage"} for item in gathered)
+    torch.testing.assert_close(gathered[1].extra_kwargs["advantage"], torch.tensor(0.5))
 
 
 def test_gather_samples_keeps_large_cpu_fields_on_separate_paths(monkeypatch):
@@ -150,6 +229,47 @@ def test_gather_samples_keeps_large_cpu_fields_on_separate_paths(monkeypatch):
 
     assert len(accelerator.calls) == 2
     assert all(call.shape == (1, 2) for call in accelerator.calls)
+
+
+def test_gather_samples_packs_optional_scalar_metadata_without_pickle(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dist_utils,
+        "gather_object",
+        lambda _values: (_ for _ in ()).throw(
+            AssertionError("optional scalar metadata must use the tensor collective")
+        ),
+    )
+    accelerator = GatherRecorder()
+    samples = [
+        BaseSample(
+            source_id=3,
+            sampling_group_id=10 + index,
+            sampling_group_member_id=index,
+            sampling_sample_id=100 + index,
+        )
+        for index in range(2)
+    ]
+
+    gathered = gather_samples(
+        accelerator,
+        samples,
+        [
+            "source",
+            "source_id",
+            "sampling_group_id",
+            "sampling_group_member_id",
+            "sampling_sample_id",
+            "_unique_id",
+        ],
+    )
+
+    assert len(accelerator.calls) == 1
+    assert accelerator.calls[0].device.type == "cpu"
+    assert accelerator.calls[0].dtype == torch.int64
+    assert [sample.source for sample in gathered] == [None] * 4
+    assert [sample.source_id for sample in gathered] == [3, 3, 3, 3]
+    assert [sample.unique_id for sample in gathered] == [10, 11, 10, 11]
+    assert [sample.sampling_sample_id for sample in gathered] == [100, 101, 100, 101]
 
 
 def test_zero_std_ratio_rides_the_existing_batched_stats_reduction():

@@ -66,6 +66,12 @@ from ..data_utils.loader import (
     get_eval_dataloaders,
     get_train_dataloader,
 )
+from ..data_utils.sampling_plan import (
+    SAMPLING_GROUP_ID_COLUMN,
+    SAMPLING_GROUP_MEMBER_ID_COLUMN,
+    SAMPLING_IDENTITY_COLUMNS,
+    SAMPLING_SAMPLE_ID_COLUMN,
+)
 from ..hparams import *
 from ..hparams.optimizer_args import OptimizerArguments
 from ..loading import ComponentRole, ModelLoadCoordinator
@@ -104,7 +110,8 @@ from ..utils.checkpoint import (
     download_hf_checkpoint,
     parse_hf_checkpoint_path,
 )
-from ..utils.dist import gather_aligned_floating_tensors, reduce_loss_info
+from ..utils.dist import gather_aligned_floating_tensors, get_world_size, reduce_loss_info
+from ..utils.group_coordinator import GroupCoordinator
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
 from .common.runtime_identity import (
@@ -446,6 +453,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             "rank_local": "rank_local",
             "global_batch": "cross_rank_sharded",
             "global_tile": "cross_rank_tiled",
+            "subgroup_tile": "cross_rank_tiled",
         }[sampler_contract.group_placement]
         if geometry.group_layout != expected_group_layout:
             raise ValueError(
@@ -545,15 +553,29 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             "rank_local": "rank_local",
             "global_batch": "cross_rank_sharded",
             "global_tile": "cross_rank_tiled",
+            "subgroup_tile": "cross_rank_tiled",
         }.get(sampler_contract.group_placement)
         if group_layout is None:
             raise ValueError(
                 f"sampler {sampler_contract.name!r} does not expose bounded group-complete "
                 "work units for reward/optimization overlap"
             )
+        group_window_batches = None
+        if group_layout != "rank_local":
+            group_window_batches = sampler_contract.global_group_window_batches(
+                num_replicas=get_world_size(),
+                per_device_batch_size=config.training_args.per_device_batch_size,
+                group_size=config.training_args.group_size,
+                subgroup_size=(
+                    config.data_args.sampler_subgroup_size
+                    if sampler_contract.group_placement == "subgroup_tile"
+                    else None
+                ),
+            )
         return RewardTileGeometry(
             group_layout=group_layout,
             optimizer_terms_per_batch=config.training_args.get_num_train_timesteps(config),
+            group_window_batches=group_window_batches,
         )
 
     @classmethod
@@ -968,12 +990,22 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         self.reward_processor: Optional[RewardProcessor] = None
         self.reward_buffer: Optional[RewardBuffer] = None
         self.advantage_processor: Optional[AdvantageProcessor] = None
+        self.group_coordinator: Optional[GroupCoordinator] = None
 
         # Only runtime-feedback algorithms own training-side reward groups. Dataset
         # acquisition intentionally leaves sampler_type="auto" because its official
         # DistributedSampler has no reward-group layout to resolve.
         if type(self).execution_contract.feedback is FeedbackMode.RUNTIME_REWARD:
             sampler_layout = get_sampler_layout_contract(self.config.data_args.sampler_type)
+            self.group_coordinator = GroupCoordinator(
+                self.accelerator,
+                sampler_type=self.config.data_args.sampler_type,
+                subgroup_size=(
+                    self.config.data_args.sampler_subgroup_size
+                    if sampler_layout.group_placement == "subgroup_tile"
+                    else None
+                ),
+            )
             group_on_same_rank = sampler_layout.groups_are_rank_local
             async_groupwise_rewards = tuple(
                 name
@@ -994,6 +1026,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 tokenizer=self.adapter.tokenizer,  # For prompt encoding/decoding,
                 group_on_same_rank=group_on_same_rank,
                 verbose=self.log_args.verbose,
+                group_coordinator=self.group_coordinator,
             )
             self.reward_buffer = RewardBuffer(
                 self.reward_processor,
@@ -1010,6 +1043,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 sampler_type=self.config.data_args.sampler_type,
                 verbose=self.log_args.verbose,
                 source_id_to_name=self.config.data_args.source_id_to_name,
+                group_coordinator=self.group_coordinator,
             )
 
         # Per-eval-dataset reward processors and buffers.  Eval is now
@@ -2120,6 +2154,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 group_layout=geometry.group_layout,
                 optimizer_examples_per_group=geometry.optimizer_examples_per_group,
                 accumulation_scope=geometry.accumulation_scope,
+                group_window_batches=geometry.group_window_batches,
                 manifest=self._reward_overlap_acquisition_manifest,
                 num_replicas=self.accelerator.num_processes,
             )
@@ -2225,6 +2260,17 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             "cross_rank_sharded": 1,
             "cross_rank_tiled": 2,
         }[plan.geometry.group_layout]
+        local_group_identities: Optional[torch.Tensor] = None
+        local_identity_error: Optional[Exception] = None
+        if cross_rank_groups:
+            try:
+                local_group_identities = torch.as_tensor(
+                    group_identity_rows(samples),
+                    dtype=torch.int64,
+                    device=self.accelerator.device,
+                )
+            except Exception as error:
+                local_identity_error = error
         local_header = torch.tensor(
             [
                 len(plan.tiles),
@@ -2233,6 +2279,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 plan.sample_count,
                 len(samples),
                 group_layout_code,
+                int(local_identity_error is not None),
             ],
             dtype=torch.int64,
             device=self.accelerator.device,
@@ -2255,8 +2302,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             )
         gathered_headers = gathered_headers.reshape(self.accelerator.num_processes, -1).cpu()
         if not torch.equal(
-            gathered_headers,
-            gathered_headers[0].expand_as(gathered_headers),
+            gathered_headers[:, :6],
+            gathered_headers[0, :6].expand_as(gathered_headers[:, :6]),
         ):
             raise RuntimeError(
                 "reward tile geometry differs across ranks: "
@@ -2269,34 +2316,40 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 "reward tile plan sample count differs from the local sample count: "
                 f"headers={gathered_headers.tolist()!r}"
             )
+        if torch.any(gathered_headers[:, 6]):
+            self._raise_reward_overlap_errors("tile UID preparation", local_identity_error)
         if not cross_rank_groups:
             return
 
-        local_group_identities: Optional[torch.Tensor] = None
-        local_error: Optional[Exception] = None
-        try:
-            local_group_identities = torch.as_tensor(
-                group_identity_rows(samples),
-                dtype=torch.int64,
-                device=self.accelerator.device,
-            )
-        except Exception as error:
-            local_error = error
-        self._synchronize_reward_overlap_error("tile UID preparation", local_error)
-        if local_group_identities is None:  # pragma: no cover - synchronized failure above
+        if local_group_identities is None:  # pragma: no cover - header failure above
             raise RuntimeError("reward tile UID preparation returned no payload")
-        if self.accelerator.num_processes > 1:
-            gathered_identities = self.accelerator.gather(local_group_identities)
+        group_coordinator = getattr(self, "group_coordinator", None)
+        group_world_size = (
+            group_coordinator.group_world_size
+            if group_coordinator is not None
+            else self.accelerator.num_processes
+        )
+        group_rank = (
+            group_coordinator.group_rank
+            if group_coordinator is not None
+            else self.accelerator.process_index
+        )
+        if group_world_size > 1:
+            gathered_identities = (
+                group_coordinator.gather(local_group_identities)
+                if group_coordinator is not None
+                else self.accelerator.gather(local_group_identities)
+            )
         else:
             gathered_identities = local_group_identities
-        expected_identity_values = self.accelerator.num_processes * plan.sample_count * 2
+        expected_identity_values = group_world_size * plan.sample_count * 2
         if int(gathered_identities.numel()) != expected_identity_values:
             raise RuntimeError(
                 "distributed reward identity validation returned an invalid cardinality: "
                 f"expected={expected_identity_values}, received={gathered_identities.numel()}"
             )
         gathered_identities = gathered_identities.reshape(
-            self.accelerator.num_processes,
+            group_world_size,
             plan.sample_count,
             2,
         )
@@ -2313,7 +2366,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 group_indices=inverse.cpu().numpy(),
                 source_ids=identities[:, 0].cpu().numpy(),
                 local_sample_count=stop - start,
-                num_processes=self.accelerator.num_processes,
+                num_processes=group_world_size,
             )
 
         self._reward_overlap_acquisition_group_layout = collected_layout(
@@ -2382,14 +2435,14 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                     )
                 seen_groups.update(batch_groups)
                 local_batch_identities = gathered_identities[
-                    self.accelerator.process_index,
+                    group_rank,
                     batch_start:batch_stop,
                 ]
                 local_batch_size = batch_stop - batch_start
                 local_group_indices = inverse.reshape(
-                    self.accelerator.num_processes,
+                    group_world_size,
                     local_batch_size,
-                )[self.accelerator.process_index]
+                )[group_rank]
                 tile_group_infos.append(
                     _RewardOverlapGroupInfo(
                         local_group_identities=local_batch_identities.clone(),
@@ -2416,21 +2469,38 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         tile: RewardTile,
         samples: List[BaseSample],
     ) -> None:
-        """Resolve one tile before any rank enters advantage collectives."""
+        """Resolve and validate one tile before entering advantage collectives.
+
+        Reward resolution and payload preparation are both rank-local, so one
+        error reduction guards them together. Keeping separate guards would add
+        one redundant global collective to every optimizer work unit.
+        """
         rewards: Dict[str, torch.Tensor] = {}
+        prepared_collection = None
         local_error: Optional[Exception] = None
         try:
             rewards = self.reward_buffer.resolve_streaming_tile(tile.sample_indices)
+            prepared_collection = self.advantage_processor.prepare_group_reward_collection(
+                samples,
+                rewards,
+                require_all_rewards=True,
+                collected_layout=self._reward_overlap_group_layouts_by_tile.get(tile.tile_id),
+            )
         except Exception as error:
             local_error = error
-        self._synchronize_reward_overlap_error("tile reward resolution", local_error)
-        self._compute_synchronized_reward_overlap_advantages(
-            samples,
-            rewards,
-            phase="tile advantage",
-            build_metrics=False,
-            collected_layout=self._reward_overlap_group_layouts_by_tile.get(tile.tile_id),
-        )
+        self._synchronize_reward_overlap_error("tile feedback preparation", local_error)
+
+        local_error = None
+        try:
+            self._compute_reward_overlap_advantages(
+                samples,
+                rewards,
+                build_metrics=False,
+                prepared_collection=prepared_collection,
+            )
+        except Exception as error:
+            local_error = error
+        self._synchronize_reward_overlap_error("tile advantage computation", local_error)
 
     def _compute_synchronized_reward_overlap_advantages(
         self,
@@ -2853,7 +2923,10 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         Returns:
             List of generated ``BaseSample`` instances with metadata injected.
         """
-        sample_kwargs = {**self.training_args, **extra_inference_kwargs, **batch}
+        model_batch = {
+            key: value for key, value in batch.items() if key not in SAMPLING_IDENTITY_COLUMNS
+        }
+        sample_kwargs = {**self.training_args, **extra_inference_kwargs, **model_batch}
         sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
         sample_batch = self.adapter.inference(**sample_kwargs)
 
@@ -2922,8 +2995,9 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         Drives both the ``RewardProcessor`` gate and the
         ``AdvantageProcessor`` applicability mask.
 
-        No-op when ``batch['metadata']``, ``batch['__source__']`` and
-        ``batch['__source_id__']`` are all absent or empty.
+        Planned training batches additionally carry three reserved sampling
+        identity columns. These are attached one-to-one to generated samples
+        and never forwarded to the adapter API.
 
         Args:
             samples: Generated samples from ``adapter.inference()``.
@@ -2936,26 +3010,51 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         sources = batch.get("__source__")
         source_ids = batch.get("__source_id__")
         metadata_list = batch.get(METADATA_COLUMN)
-        if not metadata_list and not sources and not source_ids:
+        group_ids = batch.get(SAMPLING_GROUP_ID_COLUMN)
+        group_member_ids = batch.get(SAMPLING_GROUP_MEMBER_ID_COLUMN)
+        sample_ids = batch.get(SAMPLING_SAMPLE_ID_COLUMN)
+        identity_values = (group_ids, group_member_ids, sample_ids)
+        has_sampling_identity = any(value is not None for value in identity_values)
+        if has_sampling_identity and not all(value is not None for value in identity_values):
+            raise ValueError(
+                "planned batches must carry group, member, and sample identity together"
+            )
+        if (
+            metadata_list is None
+            and sources is None
+            and source_ids is None
+            and not has_sampling_identity
+        ):
             return
         if not samples:
             return
 
-        # Pick a length-bearing reference for the broadcast ratio.
-        if metadata_list:
-            B = len(metadata_list)
-        elif sources:
-            B = len(sources)
-        elif source_ids:
-            B = len(source_ids)
-        else:
-            return
-        samples_per_prompt = len(samples) // B
-        if samples_per_prompt == 0:
+        columns = [
+            value
+            for value in (
+                metadata_list,
+                sources,
+                source_ids,
+                group_ids,
+                group_member_ids,
+                sample_ids,
+            )
+            if value is not None
+        ]
+        B = len(columns[0])
+        if any(len(value) != B for value in columns):
+            raise ValueError("batch metadata and sampling identity columns must have equal length")
+        if has_sampling_identity and len(samples) != B:
+            raise ValueError(
+                "planned sampling identity requires one adapter output per dataloader row: "
+                f"rows={B}, outputs={len(samples)}"
+            )
+        samples_per_prompt = 1 if has_sampling_identity else len(samples) // B
+        if samples_per_prompt < 1:
             return
 
         for i, sample in enumerate(samples):
-            batch_idx = i // samples_per_prompt
+            batch_idx = i if has_sampling_identity else i // samples_per_prompt
             if batch_idx >= B:
                 continue
             if metadata_list:
@@ -2969,6 +3068,12 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 sample.source = sources[batch_idx]
             if source_ids:
                 sample.source_id = source_ids[batch_idx]
+            if has_sampling_identity:
+                sample.assign_sampling_identity(
+                    group_id=int(group_ids[batch_idx]),
+                    group_member_id=int(group_member_ids[batch_idx]),
+                    sample_id=int(sample_ids[batch_idx]),
+                )
 
     # ============================ Public Sampling API ============================
 
@@ -3034,6 +3139,10 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         # for the bare DataLoader (no `set_epoch`).
         if hasattr(self.dataloader, "set_epoch"):
             self.dataloader.set_epoch(self.epoch)
+        else:
+            sampler = getattr(self.dataloader, "batch_sampler", None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(self.epoch)
 
         samples: List[BaseSample] = []
         data_iter = iter(self.dataloader)

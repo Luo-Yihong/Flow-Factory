@@ -440,6 +440,7 @@ def test_offline_trainers_do_not_construct_runtime_feedback_pipeline(
     assert trainer.reward_processor is None
     assert trainer.reward_buffer is None
     assert trainer.advantage_processor is None
+    assert trainer.group_coordinator is None
 
 
 def test_sft_reencodes_targets_and_preserves_optimizer_cadence(
