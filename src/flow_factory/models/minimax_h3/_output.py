@@ -26,15 +26,19 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ...contracts import MediaType
+from ...contracts import MediaGeometry, MediaType
 from ...samples import LatentState
-from ...utils.audio import convert_audio
+from ...utils.audio import convert_audio, require_decoded_audio_waveform
+from ...utils.video import (
+    decoded_video_to_unit_float,
+    require_decoded_video_frames,
+    require_finite_bcfhw_video,
+)
 from ..configured_image_output import retrieve_vae_latents
 from ..output_state import (
     DecodedMediaBatch,
     EncodedOutputState,
     GeometrySignature,
-    MediaGeometrySignature,
 )
 from ._common import pack_audio_latents, pack_video_latents, validate_target_state
 from .workflow import _normalize_geometry, _normalize_layout
@@ -180,14 +184,14 @@ class MiniMaxH3AVOutputCodec:
         frame_rate = float(self.adapter.pipeline.fps)
         signature = GeometrySignature(
             media=(
-                MediaGeometrySignature(
+                MediaGeometry(
                     type=MediaType.VIDEO,
                     height=geometry["height"],
                     width=geometry["width"],
                     frames=geometry["num_frames"],
                     fps=frame_rate,
                 ),
-                MediaGeometrySignature(
+                MediaGeometry(
                     type=MediaType.AUDIO,
                     samples=target_audio_samples,
                     sample_rate=sample_rate,
@@ -409,18 +413,7 @@ def prepare_h3_target_video(
     Returns:
         Float32 pixels shaped ``(1, 3, F, H, W)`` in the unit interval.
     """
-    if not isinstance(payload, np.ndarray):
-        raise TypeError(
-            "MiniMax H3 target video expected a decoded NumPy array, "
-            f"received {type(payload).__name__}"
-        )
-    if payload.dtype != np.uint8 or payload.ndim != 4 or payload.shape[-1] != 3:
-        raise ValueError(
-            "MiniMax H3 target video must be uint8 RGB shaped (F,H,W,3), "
-            f"received dtype={payload.dtype}, shape={tuple(payload.shape)}"
-        )
-    if payload.shape[0] < 1:
-        raise ValueError("MiniMax H3 target video must contain at least one frame")
+    payload = require_decoded_video_frames(payload, source="MiniMax H3 target video")
     source_fps = _positive_real(source_fps, "target video fps")
     target_fps = _positive_real(target_fps, "model video fps")
     frames = payload
@@ -447,8 +440,16 @@ def prepare_h3_target_video(
                 for frame in frames
             ]
         )
-    pixels = torch.from_numpy(np.ascontiguousarray(frames)).permute(3, 0, 1, 2).unsqueeze(0)
-    return pixels.to(torch.float32).div_(255.0)
+    unit_frames = decoded_video_to_unit_float(frames, source="MiniMax H3 sampled target video")
+    pixels = torch.from_numpy(unit_frames).permute(3, 0, 1, 2).unsqueeze(0)
+    return require_finite_bcfhw_video(
+        pixels,
+        source="MiniMax H3 unit target pixels",
+        batch_size=1,
+        frames=target_frames,
+        height=height,
+        width=width,
+    )
 
 
 def encode_h3_target_video(
@@ -528,22 +529,12 @@ def prepare_h3_target_audio(
     Returns:
         Contiguous float32 stereo waveform shaped ``(2, target_samples)``.
     """
-    if not isinstance(payload, torch.Tensor):
-        raise TypeError(
-            "MiniMax H3 target audio expected a decoded torch.Tensor, "
-            f"received {type(payload).__name__}"
-        )
-    if payload.ndim != 2 or payload.shape[0] not in (1, 2) or payload.shape[1] < 1:
+    payload = require_decoded_audio_waveform(payload, source="MiniMax H3 target audio")
+    if payload.shape[0] not in (1, 2):
         raise ValueError(
-            "MiniMax H3 target audio must be non-empty mono/stereo shaped (C,S), "
-            f"received {tuple(payload.shape)}"
+            "MiniMax H3 target audio must be mono or stereo, "
+            f"received {payload.shape[0]} channels"
         )
-    if not payload.is_floating_point():
-        raise TypeError(
-            f"MiniMax H3 target audio expected floating waveform, received {payload.dtype}"
-        )
-    if not torch.isfinite(payload).all():
-        raise ValueError("MiniMax H3 target audio contains non-finite samples")
     source_sample_rate = _positive_int(source_sample_rate, "target audio sample_rate")
     target_sample_rate = _positive_int(target_sample_rate, "model audio sample_rate")
     target_samples = _positive_int(target_samples, "target audio samples")
@@ -712,14 +703,14 @@ def validate_h3_encoded_output_geometry(
     )
     expected_signature = GeometrySignature(
         media=(
-            MediaGeometrySignature(
+            MediaGeometry(
                 type=MediaType.VIDEO,
                 height=geometry["height"],
                 width=geometry["width"],
                 frames=geometry["num_frames"],
                 fps=float(adapter.pipeline.fps),
             ),
-            MediaGeometrySignature(
+            MediaGeometry(
                 type=MediaType.AUDIO,
                 samples=geometry["num_audio_latents"] * hop_length,
                 sample_rate=sample_rate,

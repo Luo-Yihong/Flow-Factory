@@ -42,6 +42,11 @@ Value Ranges:
     - [0, 1]: Normalized float format (PyTorch convention)
     - [-1, 1]: Normalized float format (diffusion model convention)
 
+Offline Decoded-Target Contract:
+    - RGB PIL.Image.Image with positive width and height
+    - Keep byte-domain pixels in PIL until the model-owned image processor
+    - Validate with require_decoded_rgb_image() before model preprocessing
+
 Main Functions:
     Type Validation:
         - is_image(), is_image_list(), is_image_batch(), is_multi_image_batch()
@@ -51,6 +56,7 @@ Main Functions:
         - pil_image_to_tensor(), pil_image_to_numpy()
 
     Standardization:
+        - require_decoded_rgb_image(): Validate canonical decoded RGB targets
         - standardize_image_batch(): Unified conversion to pil/np/pt formats
         - normalize_to_uint8(): Auto-detect range and normalize to [0, 255]
 
@@ -74,6 +80,9 @@ from typing import Any, List, Literal, Union
 import numpy as np
 import torch
 from PIL import Image
+
+from ..contracts.media import DECODED_IMAGE_REPRESENTATION, MODEL_IMAGE_REPRESENTATION
+from .media import require_media_payload
 
 # ----------------------------------- Type Aliases --------------------------------------
 
@@ -124,6 +133,8 @@ __all__ = [
     "pil_image_to_numpy",
     "pil_image_to_base64",
     # Normalization
+    "require_decoded_rgb_image",
+    "require_finite_bchw_image",
     "normalize_to_uint8",
     "standardize_image_batch",
 ]
@@ -340,6 +351,60 @@ def is_multi_image_batch(image_batches: Any) -> bool:
 # ----------------------------------- Normalization --------------------------------------
 
 
+def require_decoded_rgb_image(payload: Any, *, source: str) -> Image.Image:
+    """Require one canonical decoded RGB target image.
+
+    Args:
+        payload: Candidate decoded image payload.
+        source: User-facing owner included in validation errors.
+
+    Returns:
+        The original positive-size RGB ``PIL.Image.Image``.
+
+    Raises:
+        TypeError: If the payload is not a PIL image.
+        ValueError: If the image mode or geometry is not canonical.
+    """
+    return require_media_payload(
+        payload,
+        representation=DECODED_IMAGE_REPRESENTATION,
+        source=source,
+    )
+
+
+def require_finite_bchw_image(
+    payload: Any,
+    *,
+    source: str,
+    batch_size: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Require one finite floating RGB image batch in exact ``BCHW`` layout.
+
+    This boundary deliberately does not impose a universal numeric interval.
+    Diffusers, Bagel, SenseNova, and future image families may use different
+    model-pixel normalization while sharing tensor type, shape, and finiteness.
+
+    Args:
+        payload: Candidate model-facing image pixels.
+        source: User-facing owner included in validation errors.
+        batch_size: Expected leading batch dimension.
+        height: Expected logical pixel height.
+        width: Expected logical pixel width.
+
+    Returns:
+        The original validated floating tensor shaped ``(B, 3, H, W)``.
+    """
+    expected_shape = (batch_size, 3, height, width)
+    return require_media_payload(
+        payload,
+        representation=MODEL_IMAGE_REPRESENTATION,
+        source=source,
+        expected_shape=expected_shape,
+    )
+
+
 def normalize_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
     """
     Detect value range and normalize to [0, 255] uint8.
@@ -359,6 +424,8 @@ def normalize_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[torch.Ten
             - If min < 0 and values in [-1, 1]: treated as [-1, 1] range
             - Elif max <= 1.0: treated as [0, 1] range
             - Else: treated as [0, 255] range (no scaling applied)
+        Offline decoded targets must use the strict ``require_decoded_rgb_image``
+        boundary instead of converting to an array and inferring its range.
     """
     is_tensor = isinstance(data, torch.Tensor)
 

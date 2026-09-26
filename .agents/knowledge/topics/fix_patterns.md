@@ -896,6 +896,66 @@ Based on the fix type, write the fix entry to the appropriate document:
   trainer/adapter boundary instead of shrinking semantic geometry or splitting its backward.
 - **Related Constraint**: #9, #20
 
+### Decoded video bytes must cross one unit-pixel boundary
+- **Date**: 2026-09-26
+- **Symptom**: Offline Wan and LTX2 target encoding could pass white pixels to the VAE as 509
+  instead of 1.
+- **Root Cause**: Decoders return uint8 RGB arrays, but Diffusers treats NumPy video input as
+  floating pixels already scaled to [0, 1]; its normalization only applies `2 * x - 1`.
+- **Fix**: Add a strict shared `utils/video.py` boundary for C-contiguous uint8 RGB FHWC and convert
+  sampled targets once into float32 unit pixels. Reuse it in Wan, LTX2, and the already-correct H3
+  path while preserving family-specific temporal and VAE normalization semantics.
+- **Lesson**: Share representation boundaries, not model-specific normalization. Test numeric
+  endpoints with the real third-party processor, not only a shape stub.
+- **Related Constraint**: #12, #20
+- **Evidence**: Real VideoProcessor regressions fail before the fix for black, white, and mixed
+  pixels and pass afterward. Utility and codec tests cover Wan/LTX2, while H3 parity remains exact.
+- **Commit**: See the Git commit introducing this entry.
+
+### Decoded image bytes must stay on the RGB PIL boundary
+- **Date**: 2026-09-26
+- **Symptom**: A real Diffusers image processor maps a white `uint8` NumPy target to 509 instead
+  of 1, so a custom decoder or refactor that replaced the built-in PIL payload could reproduce the
+  same silent scaling failure as video targets.
+- **Root Cause**: PIL images and NumPy arrays carry different numerical semantics at the Diffusers
+  preprocessing boundary, while image codecs independently checked only for a PIL base type and
+  did not encode the complete RGB/positive-geometry contract in one shared utility.
+- **Fix**: Add `require_decoded_rgb_image()` in `utils/image.py`, use it in the default decoder and
+  every image output codec family, and preserve each family's released preprocessing: Diffusers
+  image processors, Bagel `ToTensor` plus mean/std, and SenseNova `x/127.5-1`.
+- **Lesson**: For decoded images, share and validate the byte-domain container rather than adding a
+  universal float converter. Test black, midpoint, and white through the real family processors,
+  because identical array values can mean different pixels when their container types differ.
+- **Related Constraint**: #12, #20
+- **Evidence**: Utility tests reject ambiguous payloads; real Diffusers and Bagel transforms plus
+  the SenseNova codec map `(0,127,255)` to their expected model-pixel endpoints.
+- **Commit**: See the Git commit introducing this entry.
+
+### Model-pixel and decoded-audio boundaries must validate runtime representation
+- **Date**: 2026-09-26
+- **Symptom**: The offline media guide promised finite floating `BCHW`/`BCFHW` model pixels, but
+  configured image codecs and Wan checked only partial geometry; an integer or non-finite processor
+  result could therefore reach the VAE. LTX2 and MiniMax H3 also duplicated looser audio checks
+  instead of enforcing the documented decoded CPU waveform boundary.
+- **Root Cause**: The shared decoded byte-container contracts stopped before reusable tensor
+  validators, so model families independently enforced different subsets of shape, dtype,
+  finiteness, device, and ownership rules.
+- **Fix**: Add dependency-neutral `MediaRepresentation`, `MediaFormat`, and `MediaGeometry`
+  primitives plus one `utils/media.py` runtime validator. Keep the public image/video/audio helpers
+  as thin wrappers and reuse them across grouped/ordered input decoding, default supervision
+  decoding, configured image, Bagel, SenseNova, Wan, LTX2, and MiniMax H3. Input and output
+  contracts now compose the same physical format, decoded output validation is central, cache
+  identity includes the representation, and encoded-state validation rejects non-finite clean
+  components while retaining adapter-owned latent intervals.
+- **Lesson**: A common numerical boundary should standardize only facts shared by every model.
+  Enforce container, layout, dtype, channel/color semantics, ownership, and finiteness centrally while leaving each
+  adapter's released pixel/latent interval and packing convention explicit.
+- **Related Constraint**: #12, #20
+- **Evidence**: Contract tests cover modality/representation coherence and shared geometry/rates;
+  runtime tests cover decoded and model-pixel container/layout/dtype/range enforcement; output
+  state and condition-cache tests cover central validation and representation-sensitive identity.
+- **Commit**: See the Git commit introducing this entry.
+
 ## Cross-refs
 
 - UP: [Hard Constraints](../constraints.md), [Architecture](../architecture.md)

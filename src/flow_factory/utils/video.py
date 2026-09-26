@@ -45,6 +45,11 @@ Value Ranges:
     - [0, 1]: Normalized float format (PyTorch convention)
     - [-1, 1]: Normalized float format (diffusion model convention)
 
+Offline Decoded-Target Contract:
+    - CPU C-contiguous np.uint8 RGB with shape (F, H, W, 3)
+    - Source fps remains separate metadata
+    - Convert exactly once with decoded_video_to_unit_float() before model normalization
+
 Main Functions:
     Type Validation:
         - is_video(), is_video_list(), is_video_batch(), is_multi_video_batch()
@@ -55,6 +60,8 @@ Main Functions:
         - video_frames_to_tensor(), video_frames_to_numpy()
 
     Standardization:
+        - require_decoded_video_frames(): Validate canonical decoded RGB bytes
+        - decoded_video_to_unit_float(): Convert decoded RGB bytes once to [0, 1]
         - standardize_video_batch(): Unified conversion to pil/np/pt formats
         - normalize_video_to_uint8(): Auto-detect range and normalize to [0, 255]
 
@@ -85,6 +92,13 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import numpy as np
 import torch
 from PIL import Image
+
+from ..contracts.media import (
+    DECODED_VIDEO_REPRESENTATION,
+    MODEL_VIDEO_REPRESENTATION,
+    UNIT_VIDEO_REPRESENTATION,
+)
+from .media import require_media_payload
 
 # ----------------------------------- Type Aliases --------------------------------------
 
@@ -140,6 +154,9 @@ __all__ = [
     "video_frames_to_tensor",
     "video_frames_to_numpy",
     # Normalization
+    "require_decoded_video_frames",
+    "require_finite_bcfhw_video",
+    "decoded_video_to_unit_float",
     "normalize_video_to_uint8",
     "standardize_video_batch",
 ]
@@ -373,6 +390,82 @@ def is_multi_video_batch(video_batches: Any) -> bool:
 # ----------------------------------- Normalization --------------------------------------
 
 
+def require_decoded_video_frames(payload: Any, *, source: str) -> np.ndarray:
+    """Require canonical decoded CPU RGB video frames.
+
+    Args:
+        payload: Candidate decoded video payload.
+        source: User-facing owner included in validation errors.
+
+    Returns:
+        The original C-contiguous ``uint8`` RGB array shaped ``(F, H, W, 3)``.
+
+    Raises:
+        TypeError: If the payload is not a NumPy array or does not use ``uint8``.
+        ValueError: If layout, geometry, channel count, or contiguity is invalid.
+    """
+    return require_media_payload(
+        payload,
+        representation=DECODED_VIDEO_REPRESENTATION,
+        source=source,
+    )
+
+
+def require_finite_bcfhw_video(
+    payload: Any,
+    *,
+    source: str,
+    batch_size: int,
+    frames: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Require one finite floating RGB video batch in exact ``BCFHW`` layout.
+
+    The model-pixel interval remains adapter-owned: Diffusers video processors
+    commonly produce ``[-1, 1]`` while other families apply released mean/std
+    normalization. This helper fixes only the shared tensor representation.
+
+    Args:
+        payload: Candidate model-facing video pixels.
+        source: User-facing owner included in validation errors.
+        batch_size: Expected leading batch dimension.
+        frames: Expected temporal frame count.
+        height: Expected logical pixel height.
+        width: Expected logical pixel width.
+
+    Returns:
+        The original validated floating tensor shaped ``(B, 3, F, H, W)``.
+    """
+    expected_shape = (batch_size, 3, frames, height, width)
+    return require_media_payload(
+        payload,
+        representation=MODEL_VIDEO_REPRESENTATION,
+        source=source,
+        expected_shape=expected_shape,
+    )
+
+
+def decoded_video_to_unit_float(payload: Any, *, source: str) -> np.ndarray:
+    """Convert canonical decoded RGB bytes to one float32 unit-range buffer.
+
+    Args:
+        payload: C-contiguous ``uint8`` RGB array shaped ``(F, H, W, 3)``.
+        source: User-facing owner included in validation errors.
+
+    Returns:
+        Independent C-contiguous ``float32`` FHWC array whose values are in ``[0, 1]``.
+    """
+    frames = require_decoded_video_frames(payload, source=source)
+    unit_frames = frames.astype(np.float32)
+    unit_frames /= np.float32(255.0)
+    return require_media_payload(
+        unit_frames,
+        representation=UNIT_VIDEO_REPRESENTATION,
+        source=f"{source} unit conversion",
+    )
+
+
 def normalize_video_to_uint8(
     data: Union[torch.Tensor, np.ndarray],
 ) -> Union[torch.Tensor, np.ndarray]:
@@ -394,6 +487,8 @@ def normalize_video_to_uint8(
             - If min < 0 and values in [-1, 1]: treated as [-1, 1] range
             - Elif max <= 1.0: treated as [0, 1] range
             - Else: treated as [0, 255] range (no scaling applied)
+        Offline decoded targets must use the strict ``require_decoded_video_frames`` and
+        ``decoded_video_to_unit_float`` boundary instead of range detection.
     """
     is_tensor = isinstance(data, torch.Tensor)
 
@@ -761,6 +856,10 @@ def standardize_video_batch(
 
     Raises:
         ValueError: If input type is unsupported.
+
+    Note:
+        This permissive presentation/reward conversion is not the offline target contract.
+        Output codecs must use ``decoded_video_to_unit_float`` for decoded bytes.
 
     Example:
         >>> # Single video -> batch

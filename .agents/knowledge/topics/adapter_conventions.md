@@ -242,6 +242,29 @@ LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PA
     output, so under FSDP2 the adapter registers every owning unit's pre-backward hook on them;
     any new side-output cache needs the same bridge before it can train under parameter sharding.
 
+18. **Decoded video bytes cross one explicit unit-pixel boundary** — Built-in offline video
+    decoders return C-contiguous CPU `uint8` RGB `FHWC`; output codecs validate that representation
+    and call `decoded_video_to_unit_float()` exactly once. Unit pixels are shared, but model pixels
+    are not: Wan/LTX2 use Diffusers `[-1,1]`, while MiniMax H3 applies checkpoint mean/std. Reject
+    ambiguous float payloads instead of guessing their range, and keep temporal geometry,
+    posterior policy, and latent packing adapter-owned.
+
+19. **Decoded image bytes stay inside one explicit RGB PIL boundary** — Built-in offline image
+    decoders return detached positive-size RGB PIL images, and every image output codec validates
+    that representation with `require_decoded_rgb_image()` before model preprocessing. Container
+    type carries numerical meaning: Diffusers converts PIL bytes to unit pixels but treats NumPy
+    arrays as already unit-scaled. Reject array/tensor payloads and non-RGB modes instead of
+    guessing or silently converting them. Share this decoded-media boundary while keeping resize,
+    posterior policy, model pixel normalization, and latent packing adapter-owned.
+
+20. **Input and output contracts compose one physical media format** — Declare container, layout,
+    dtype, channels/color space, device/ownership, finiteness, and optional value range exactly once in
+    `MediaRepresentation`, then embed it in `MediaFormat`. Input rules add cardinality/slots/binding;
+    output sequences add exact order. Use `MediaGeometry` for actual dimensions and clocks instead
+    of creating role- or model-specific geometry dataclasses. The generic runtime validator owns
+    representation checks; modality helpers may add conversion semantics but must not duplicate
+    the physical contract.
+
 ## Fix Records
 
 ### Sampling CFG leaked into finite-data velocity matching

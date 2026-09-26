@@ -25,14 +25,18 @@ from typing import Any, ClassVar, Optional, Tuple
 import numpy as np
 import torch
 
-from ...contracts import MediaType
+from ...contracts import MediaGeometry, MediaType
 from ...samples import LatentState
+from ...utils.video import (
+    decoded_video_to_unit_float,
+    require_decoded_video_frames,
+    require_finite_bcfhw_video,
+)
 from ..configured_image_output import retrieve_vae_latents
 from ..output_state import (
     DecodedMediaBatch,
     EncodedOutputState,
     GeometrySignature,
-    MediaGeometrySignature,
 )
 
 
@@ -94,13 +98,7 @@ def resample_wan_output_video(
     target_fps: float,
 ) -> np.ndarray:
     """Select deterministic nearest-time frames for configured target cadence."""
-    if video.dtype != np.uint8 or video.ndim != 4 or video.shape[-1] != 3:
-        raise ValueError(
-            "Wan decoded target video must be uint8 RGB shaped (F,H,W,3), "
-            f"received dtype={video.dtype}, shape={tuple(video.shape)}"
-        )
-    if video.shape[0] < 1:
-        raise ValueError("Wan decoded target video must contain at least one frame")
+    video = require_decoded_video_frames(video, source="Wan decoded target video")
     if isinstance(source_fps, bool) or not isinstance(source_fps, Real):
         raise TypeError(
             "Wan target video requires source fps metadata, "
@@ -241,15 +239,9 @@ class WanVideoOutputCodec:
                     f"received {len(candidate)} for sample {sample_index}"
                 )
             media = candidate[0]
-            payload = media.payload
-            if not isinstance(payload, np.ndarray):
-                raise TypeError(
-                    "Wan output codec expected decoded NumPy video targets, "
-                    f"received {type(payload).__name__} for sample {sample_index}"
-                )
             videos.append(
                 resample_wan_output_video(
-                    payload,
+                    media.payload,
                     source_fps=media.fps,
                     target_frames=num_frames,
                     target_fps=frame_rate,
@@ -257,21 +249,21 @@ class WanVideoOutputCodec:
             )
 
         pixel_values = self.adapter.pipeline.video_processor.preprocess_video(
-            videos,
+            [
+                decoded_video_to_unit_float(video, source="Wan sampled target video")
+                for video in videos
+            ],
             height=height,
             width=width,
         )
-        if not isinstance(pixel_values, torch.Tensor):
-            raise TypeError(
-                "Wan video_processor.preprocess_video must return torch.Tensor, "
-                f"received {type(pixel_values).__name__}"
-            )
-        expected_shape = (len(videos), 3, num_frames, height, width)
-        if tuple(pixel_values.shape) != expected_shape:
-            raise ValueError(
-                "Wan video preprocessing changed configured output geometry: "
-                f"expected {expected_shape}, received {tuple(pixel_values.shape)}"
-            )
+        require_finite_bcfhw_video(
+            pixel_values,
+            source="Wan video_processor.preprocess_video",
+            batch_size=len(videos),
+            frames=num_frames,
+            height=height,
+            width=width,
+        )
 
         vae = self.adapter.vae
         vae_dtype = getattr(vae, "dtype", None)
@@ -307,7 +299,7 @@ class WanVideoOutputCodec:
 
         signature = GeometrySignature(
             media=(
-                MediaGeometrySignature(
+                MediaGeometry(
                     type=MediaType.VIDEO,
                     height=height,
                     width=width,

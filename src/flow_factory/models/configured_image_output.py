@@ -32,13 +32,13 @@ from typing import Any, ClassVar, Literal, Optional, Tuple
 import torch
 from PIL import Image
 
-from ..contracts import GeometrySource, MediaType
+from ..contracts import GeometrySource, MediaGeometry, MediaType
 from ..samples import LatentState
+from ..utils.image import require_decoded_rgb_image, require_finite_bchw_image
 from .output_state import (
     DecodedMediaBatch,
     EncodedOutputState,
     GeometrySignature,
-    MediaGeometrySignature,
     OutputStateCodec,
 )
 
@@ -116,7 +116,7 @@ class ConfiguredImageOutputCodec:
 
         signature = GeometrySignature(
             media=(
-                MediaGeometrySignature(
+                MediaGeometry(
                     type=MediaType.IMAGE,
                     height=height,
                     width=width,
@@ -141,12 +141,12 @@ class ConfiguredImageOutputCodec:
                     f"received {len(candidate)} for sample {sample_index}"
                 )
             payload = candidate[0].payload
-            if not isinstance(payload, Image.Image):
-                raise TypeError(
-                    "configured image output codec expected decoded PIL.Image targets, "
-                    f"received {type(payload).__name__} for sample {sample_index}"
+            images.append(
+                require_decoded_rgb_image(
+                    payload,
+                    source=f"configured image output codec sample {sample_index}",
                 )
-            images.append(payload)
+            )
         return images
 
     @staticmethod
@@ -156,24 +156,14 @@ class ConfiguredImageOutputCodec:
         height: int,
         width: int,
     ) -> None:
-        """Require the common image processor boundary to preserve B/H/W."""
-        if not isinstance(pixel_values, torch.Tensor):
-            raise TypeError(
-                "image_processor.preprocess expected torch.Tensor output, "
-                f"received {type(pixel_values).__name__}"
-            )
-        if pixel_values.ndim != 4:
-            raise ValueError(
-                "image_processor.preprocess expected rank-4 BCHW output, "
-                f"received shape {tuple(pixel_values.shape)}"
-            )
-        expected = (batch_size, height, width)
-        received = (pixel_values.shape[0], pixel_values.shape[-2], pixel_values.shape[-1])
-        if received != expected:
-            raise ValueError(
-                "image_processor.preprocess changed configured target geometry: "
-                f"expected batch/height/width {expected}, received {received}"
-            )
+        """Require the common image processor tensor boundary."""
+        require_finite_bchw_image(
+            pixel_values,
+            source="image_processor.preprocess",
+            batch_size=batch_size,
+            height=height,
+            width=width,
+        )
 
 
 class ConfiguredImageOutputAdapterMixin:
@@ -267,7 +257,7 @@ class ConfiguredImageOutputAdapterMixin:
         height, width = self._configured_output_geometry()
         expected_signature = GeometrySignature(
             media=(
-                MediaGeometrySignature(
+                MediaGeometry(
                     type=MediaType.IMAGE,
                     height=height,
                     width=width,

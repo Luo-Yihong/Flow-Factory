@@ -27,16 +27,20 @@ import numpy as np
 import torch
 import torchaudio
 
-from ...contracts import MediaType
+from ...contracts import MediaGeometry, MediaType
 from ...samples import LatentState
-from ...utils.audio import convert_audio
+from ...utils.audio import convert_audio, require_decoded_audio_waveform
+from ...utils.video import (
+    decoded_video_to_unit_float,
+    require_decoded_video_frames,
+    require_finite_bcfhw_video,
+)
 from ..condition_state import PreparedConditionState
 from ..configured_image_output import retrieve_vae_latents
 from ..output_state import (
     DecodedMediaBatch,
     EncodedOutputState,
     GeometrySignature,
-    MediaGeometrySignature,
 )
 
 LTX2_OFFLINE_FORWARD_OVERRIDES = MappingProxyType(
@@ -296,14 +300,14 @@ class LTX2AVOutputCodec:
 
         signature = GeometrySignature(
             media=(
-                MediaGeometrySignature(
+                MediaGeometry(
                     type=MediaType.VIDEO,
                     height=geometry.video.height,
                     width=geometry.video.width,
                     frames=geometry.video.num_frames,
                     fps=geometry.video.frame_rate,
                 ),
-                MediaGeometrySignature(
+                MediaGeometry(
                     type=MediaType.AUDIO,
                     samples=geometry.audio.target_samples,
                     sample_rate=geometry.audio.sample_rate,
@@ -537,18 +541,7 @@ def prepare_ltx2_target_video(
     geometry: LTX2VideoGeometry,
 ) -> np.ndarray:
     """Select deterministic nearest-time RGB frames on the configured cadence."""
-    if not isinstance(payload, np.ndarray):
-        raise TypeError(
-            "LTX2 target video expected a decoded NumPy array, "
-            f"received {type(payload).__name__}"
-        )
-    if payload.dtype != np.uint8 or payload.ndim != 4 or payload.shape[-1] != 3:
-        raise ValueError(
-            "LTX2 target video must be uint8 RGB shaped (F,H,W,3), "
-            f"received dtype={payload.dtype}, shape={tuple(payload.shape)}"
-        )
-    if payload.shape[0] < 1:
-        raise ValueError("LTX2 target video must contain at least one frame")
+    payload = require_decoded_video_frames(payload, source="LTX2 target video")
     source_fps = _positive_real(source_fps, "target video fps")
     indices = np.rint(
         np.arange(geometry.num_frames, dtype=np.float64) * source_fps / geometry.frame_rate
@@ -571,19 +564,11 @@ def prepare_ltx2_target_audio(
     duration_seconds: float,
 ) -> torch.Tensor:
     """Convert one waveform to the exact official LTX2 model-rate audio clock."""
-    if not isinstance(payload, torch.Tensor):
-        raise TypeError(
-            "LTX2 target audio expected a decoded torch.Tensor, "
-            f"received {type(payload).__name__}"
-        )
-    if payload.ndim != 2 or payload.shape[0] not in (1, 2) or payload.shape[1] < 1:
+    payload = require_decoded_audio_waveform(payload, source="LTX2 target audio")
+    if payload.shape[0] not in (1, 2):
         raise ValueError(
-            "LTX2 target audio must be non-empty mono/stereo shaped (C,S), "
-            f"received {tuple(payload.shape)}"
+            "LTX2 target audio must be mono or stereo, " f"received {payload.shape[0]} channels"
         )
-    if not payload.is_floating_point():
-        raise TypeError(f"LTX2 target audio expected floating waveform, received {payload.dtype}")
-    _require_finite_tensor(payload, "LTX2 target audio")
     source_sample_rate = _positive_int(source_sample_rate, "target audio sample_rate")
     duration_seconds = _positive_real(duration_seconds, "target AV duration")
     source_samples = int(duration_seconds * source_sample_rate)
@@ -670,26 +655,21 @@ def encode_ltx2_target_video(
 ) -> torch.Tensor:
     """Preprocess videos and take the deterministic VideoVAE posterior mode."""
     pixels = adapter.pipeline.video_processor.preprocess_video(
-        videos,
+        [
+            decoded_video_to_unit_float(video, source="LTX2 sampled target video")
+            for video in videos
+        ],
         height=geometry.height,
         width=geometry.width,
     )
-    if not isinstance(pixels, torch.Tensor):
-        raise TypeError(
-            "LTX2 video_processor.preprocess_video must return torch.Tensor, "
-            f"received {type(pixels).__name__}"
-        )
-    expected_shape = (len(videos), 3, geometry.num_frames, geometry.height, geometry.width)
-    if tuple(pixels.shape) != expected_shape:
-        raise ValueError(
-            "LTX2 target video preprocessing changed configured geometry: "
-            f"expected {expected_shape}, received {tuple(pixels.shape)}"
-        )
-    if not pixels.is_floating_point():
-        raise TypeError(
-            f"LTX2 target video preprocessing must return floating pixels, got {pixels.dtype}"
-        )
-    _require_finite_tensor(pixels, "LTX2 target video pixels")
+    require_finite_bcfhw_video(
+        pixels,
+        source="LTX2 video_processor.preprocess_video",
+        batch_size=len(videos),
+        frames=geometry.num_frames,
+        height=geometry.height,
+        width=geometry.width,
+    )
     vae = adapter.get_component("vae")
     encoded = vae.encode(
         pixels.to(
@@ -878,14 +858,14 @@ def validate_ltx2_encoded_output_geometry(
 
     expected_signature = GeometrySignature(
         media=(
-            MediaGeometrySignature(
+            MediaGeometry(
                 type=MediaType.VIDEO,
                 height=geometry.video.height,
                 width=geometry.video.width,
                 frames=geometry.video.num_frames,
                 fps=geometry.video.frame_rate,
             ),
-            MediaGeometrySignature(
+            MediaGeometry(
                 type=MediaType.AUDIO,
                 samples=geometry.audio.target_samples,
                 sample_rate=geometry.audio.sample_rate,

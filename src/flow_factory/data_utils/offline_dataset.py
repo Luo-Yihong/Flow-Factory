@@ -38,7 +38,9 @@ from PIL import Image
 from pydantic import ValidationError
 from torch.utils.data import Dataset
 
-from ..utils.audio import load_audio
+from ..utils.audio import load_audio, require_decoded_audio_waveform
+from ..utils.image import require_decoded_rgb_image
+from ..utils.video import require_decoded_video_frames
 
 try:
     import av
@@ -459,7 +461,11 @@ def decode_image(asset: MediaAsset) -> Image.Image:
     """
     try:
         with Image.open(asset.path) as image:
-            return image.convert("RGB")
+            decoded = image.convert("RGB")
+        return require_decoded_rgb_image(
+            decoded,
+            source=f"decoded target image {asset.path!r}",
+        )
     except (OSError, ValueError) as exc:
         raise ValueError(f"failed to decode target image {asset.path!r}: {exc}") from exc
 
@@ -467,11 +473,13 @@ def decode_image(asset: MediaAsset) -> Image.Image:
 def decode_video(asset: MediaAsset) -> np.ndarray:
     """Decode one target video into native-rate RGB frames on the CPU.
 
-    The returned ``uint8`` array has shape ``(frames, height, width, 3)`` and is
-    accepted directly by Diffusers ``VideoProcessor.preprocess_video``. Temporal
-    sampling, spatial resizing, and model-specific geometry remain adapter-owned.
-    Keeping this function at module scope makes the default decoder safe to pickle
-    under spawn-based DataLoader workers.
+    The returned canonical decoded-target representation is a C-contiguous ``uint8``
+    array shaped ``(frames, height, width, 3)``. Output codecs validate that byte
+    boundary and convert it exactly once to floating ``[0, 1]`` pixels before any
+    processor that expects unit-range NumPy input. Temporal sampling, spatial resizing,
+    and model-specific normalization remain adapter-owned. Keeping this function at
+    module scope makes the default decoder safe to pickle under spawn-based DataLoader
+    workers.
 
     Args:
         asset: Normalized video reference with a resolved local path.
@@ -505,12 +513,10 @@ def decode_video(asset: MediaAsset) -> np.ndarray:
         raise ValueError(
             f"failed to decode target video {asset.path!r}: decoded frames have inconsistent geometry"
         ) from exc
-    if video.ndim != 4 or video.shape[-1] != 3:
-        raise ValueError(
-            f"failed to decode target video {asset.path!r}: expected RGB frames shaped "
-            f"(F,H,W,3), received {video.shape}"
-        )
-    return np.ascontiguousarray(video, dtype=np.uint8)
+    return require_decoded_video_frames(
+        np.ascontiguousarray(video, dtype=np.uint8),
+        source=f"failed to decode target video {asset.path!r}",
+    )
 
 
 def decode_audio(asset: MediaAsset) -> torch.Tensor:
@@ -552,11 +558,10 @@ def decode_audio(asset: MediaAsset) -> torch.Tensor:
             f"failed to decode target audio {asset.path!r}: expected non-empty waveform "
             f"shaped (channels,samples), received {tuple(waveform.shape)}"
         )
-    if not torch.isfinite(waveform).all():
-        raise ValueError(
-            f"failed to decode target audio {asset.path!r}: waveform contains non-finite values"
-        )
-    return waveform
+    return require_decoded_audio_waveform(
+        waveform,
+        source=f"failed to decode target audio {asset.path!r}",
+    )
 
 
 DEFAULT_MEDIA_DECODERS: Mapping[MediaType, MediaDecoder] = MappingProxyType(
