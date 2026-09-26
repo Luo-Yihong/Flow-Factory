@@ -44,10 +44,10 @@ Throughout the codebase, two related but distinct scales are used for time:
 
 ### Conditional TDM score-query sampling
 - **Date**: 2026-09-25
-- **Symptom**: TDM sampled uniformly in the already shifted scheduler interval.
-- **Root Cause**: The interval sampler treated actual scheduler coordinates as the uniform source space.
-- **Fix**: TDM and TDM-R1 default to conditional logit-normal in actual sigma space; optional pre-shift uniform inverts and reapplies the generation shift captured per rollout sample. A TDM-scoped wrapper records actual `set_timesteps` arguments and restores the original instance method in `finally`; no scheduler extension is required. Float64 CDF inversion preserves the within-interval density up to its normalizing constant. Reverse query intervals default to `(stored_lower, 0.98)` in primary sigma space; disjoint preserves the original upper endpoint and ignores `tdm_t_max`. Adapters map the reverse cap to every component while replay keeps stored endpoints. Exact resume locks the changed semantics.
-- **Lesson**: A shifted interval's endpoints do not define its sampling density. Preserve the intended source distribution and generation-owned shift; do not stretch sigmoid draws or clamp unconditional samples to emulate truncation. Equal boundary weighting remains an equal mixture of conditionals.
+- **Symptom**: TDM could not express source-coordinate uniform or conditional logit-normal queries, while a reverse cap of 0.98 made the production H3 shift-12 six-step schedule empty at its first boundary.
+- **Root Cause**: Interval topology, probability distribution, and rollout shift provenance were coupled through trainer branches and sample `extra_kwargs`, with defaults that silently changed the released objective.
+- **Fix**: An immutable query policy separates `trajectory`/`reverse` topology from `actual_uniform`/`conditional_logit_normal`/`source_uniform` distributions. Compatibility defaults retain trajectory-uniform sampling; recipes opt into new policies and use an open `max_sigma=1.0`. A shared microbatch query context maps the reverse cap once. Source shifts live in typed rank-local provenance registered before reward submission and never enter samples or distributed payloads. Exact resume hashes only active policy fields.
+- **Lesson**: Query topology, coordinate distribution, and runtime provenance have distinct owners. Preserve the released numerical path as a named policy, represent bounds explicitly, and keep optimization-only metadata outside shared samples.
 - **Related Constraint**: #7, #18a.
 
 ## Cross-refs

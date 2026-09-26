@@ -20,10 +20,56 @@ import inspect
 import math
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Iterator
 
 import torch
+
+from ...hparams.training_args.tdm import TDMQuerySamplingPolicy
+from ...utils.noise_schedule import TIMESTEP_MAX, flow_match_sigma
+
+
+@dataclass(frozen=True)
+class TDMGenerationProvenance:
+    """Store rollout-only data required to replay one TDM query policy."""
+
+    source_shift: float
+
+    def __post_init__(self) -> None:
+        """Require a positive finite source-to-actual shift."""
+        if not math.isfinite(self.source_shift) or self.source_shift <= 0:
+            raise ValueError(
+                "TDM generation source_shift must be positive and finite, "
+                f"received {self.source_shift!r}"
+            )
+
+
+@dataclass(frozen=True)
+class RationalFlowShift:
+    """Map between source and actual sigma for one rollout batch."""
+
+    gamma: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """Require positive finite shift factors."""
+        if not isinstance(self.gamma, torch.Tensor):
+            raise TypeError(
+                "TDM source-uniform transform expected a torch.Tensor gamma, "
+                f"received {type(self.gamma).__name__}"
+            )
+        if not bool((torch.isfinite(self.gamma) & (self.gamma > 0)).all()):
+            raise ValueError("TDM generation shifts must be positive and finite")
+
+    def to_source(self, actual_sigma: torch.Tensor) -> torch.Tensor:
+        """Invert actual flow sigmas into the unshifted source coordinate."""
+        gamma = self.gamma.to(device=actual_sigma.device, dtype=actual_sigma.dtype)
+        return actual_sigma / (gamma - (gamma - 1) * actual_sigma)
+
+    def to_actual(self, source_sigma: torch.Tensor) -> torch.Tensor:
+        """Apply the rollout flow shift to source sigmas."""
+        gamma = self.gamma.to(device=source_sigma.device, dtype=source_sigma.dtype)
+        return gamma * source_sigma / (1 + (gamma - 1) * source_sigma)
 
 
 @contextmanager
@@ -53,7 +99,7 @@ def capture_generation_shift(scheduler: Any) -> Iterator[list[float]]:
         shift = _generation_shift(scheduler, arguments.arguments.get("mu"))
         result = original(*args, **kwargs)
         if shifts and shift != shifts[0]:
-            raise ValueError("pre_shift_uniform requires one effective shift per rollout")
+            raise ValueError("source_uniform requires one effective shift per rollout")
         if not shifts:
             shifts.append(shift)
         return result
@@ -62,7 +108,7 @@ def capture_generation_shift(scheduler: Any) -> Iterator[list[float]]:
     try:
         yield shifts
         if not shifts:
-            raise ValueError("pre_shift_uniform did not capture a set_timesteps() call")
+            raise ValueError("source_uniform did not capture a set_timesteps() call")
     finally:
         if instance_method is absent:
             del scheduler.set_timesteps
@@ -88,7 +134,7 @@ def _generation_shift(scheduler: Any, mu: float | None) -> float:
         modifiers.append("use_flow_sigmas=False")
     if modifiers:
         raise ValueError(
-            "pre_shift_uniform requires a pure flow-shift schedule; "
+            "source_uniform requires a pure flow-shift schedule; "
             f"unsupported schedule modifiers: {modifiers!r}"
         )
     if config.get("use_dynamic_shifting", False):
@@ -111,20 +157,20 @@ def sample_interval_sigma(
     lower: torch.Tensor,
     upper: torch.Tensor,
     *,
-    strategy: str,
+    distribution: str,
     logit_mean: float,
     logit_std: float,
-    shift: torch.Tensor | None = None,
+    source_transform: RationalFlowShift | None = None,
 ) -> torch.Tensor:
     """Draw one independent sigma per interval using float64 probability arithmetic.
 
     Args:
         lower: Actual lower noise coordinates in [0, 1].
         upper: Actual upper noise coordinates in [0, 1], above lower.
-        strategy: Conditional logit-normal or pre-shift uniform.
+        distribution: Actual-uniform, conditional logit-normal, or source-uniform.
         logit_mean: Mean of the untruncated normal in logit space.
         logit_std: Positive standard deviation of that normal.
-        shift: Per-sample effective shift captured during generation; uniform only.
+        source_transform: Rollout-owned source/actual transform; source-uniform only.
 
     Returns:
         Float64 noise coordinates; callers protect representable output interiors.
@@ -135,18 +181,17 @@ def sample_interval_sigma(
     fraction = torch.rand(lower.shape, device=lower.device, dtype=torch.float64)
     eps = torch.finfo(torch.float64).eps
     fraction = fraction.clamp(eps, 1 - eps)
-    if strategy == "pre_shift_uniform":
-        if shift is None:
-            raise ValueError("pre_shift_uniform requires the shift captured during generation")
-        shift = shift.to(device=lower.device, dtype=torch.float64)
-        if not bool((torch.isfinite(shift) & (shift > 0)).all()):
-            raise ValueError("Generation shift must be positive and finite")
-        u_lower = lower / (shift - (shift - 1) * lower)
-        u_upper = upper / (shift - (shift - 1) * upper)
+    if distribution == "actual_uniform":
+        return lower + fraction * (upper - lower)
+    if distribution == "source_uniform":
+        if source_transform is None:
+            raise ValueError("source_uniform requires the shift captured during generation")
+        u_lower = source_transform.to_source(lower)
+        u_upper = source_transform.to_source(upper)
         uniform = u_lower + fraction * (u_upper - u_lower)
-        return shift * uniform / (1 + (shift - 1) * uniform)
-    if strategy != "truncated_logit_normal":
-        raise ValueError(f"Unsupported TDM timestep sampling strategy: {strategy!r}")
+        return source_transform.to_actual(uniform)
+    if distribution != "conditional_logit_normal":
+        raise ValueError(f"Unsupported TDM query distribution: {distribution!r}")
 
     z_lower = (torch.logit(lower) - logit_mean) / logit_std
     z_upper = (torch.logit(upper) - logit_mean) / logit_std
@@ -161,9 +206,9 @@ def sample_interval_sigma(
     probability_upper = torch.nextafter(cdf_upper, cdf_lower)
     if not bool(((cdf_lower < cdf_upper) & (probability_lower < probability_upper)).all()):
         raise ValueError(
-            "TDM truncated_logit_normal interval has no reliable float64 probability "
+            "TDM conditional_logit_normal interval has no reliable float64 probability "
             f"interior: lower={lower.tolist()}, upper={upper.tolist()}, "
-            f"tdm_logit_mean={logit_mean}, tdm_logit_std={logit_std}"
+            f"tdm_query_logit_mean={logit_mean}, tdm_query_logit_std={logit_std}"
         )
     quantile = torch.where(reflect, 1 - fraction, fraction)
     probability = cdf_lower + quantile * (cdf_upper - cdf_lower)
@@ -171,3 +216,37 @@ def sample_interval_sigma(
     z = torch.special.ndtri(probability)
     z = torch.where(reflect, -z, z)
     return torch.sigmoid(logit_mean + logit_std * z)
+
+
+def sample_query_timestep(
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    *,
+    policy: TDMQuerySamplingPolicy,
+    source_transform: RationalFlowShift | None,
+) -> torch.Tensor:
+    """Sample one query timestep while preserving the legacy uniform path exactly.
+
+    Args:
+        lower: Actual lower scheduler timesteps.
+        upper: Actual upper scheduler timesteps.
+        policy: Immutable TDM query policy.
+        source_transform: Captured source-coordinate transform when required.
+
+    Returns:
+        Sampled scheduler timesteps in the input dtype and device.
+    """
+    if policy.distribution == "actual_uniform":
+        fraction = torch.rand(lower.shape, device=lower.device, dtype=lower.dtype)
+        precision = torch.finfo(fraction.dtype)
+        fraction = fraction.clamp(min=precision.eps, max=1.0 - precision.eps)
+        return lower + (upper - lower) * fraction
+    sigma = sample_interval_sigma(
+        flow_match_sigma(lower.double()),
+        flow_match_sigma(upper.double()),
+        distribution=policy.distribution,
+        logit_mean=policy.logit_mean,
+        logit_std=policy.logit_std,
+        source_transform=source_transform,
+    )
+    return (sigma * TIMESTEP_MAX).to(lower.dtype)

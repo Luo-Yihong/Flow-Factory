@@ -44,7 +44,7 @@ from flow_factory.trainers.role_optimization import (
 )
 
 
-def native_trainer(kind, mode, strategy, interval_mode):
+def native_trainer(kind, mode, distribution, query_interval):
     """Prepare native full/PEFT roles through the same bundle, EMA, and optimizer owners."""
     handlers = [DistributedDataParallelKwargs(find_unused_parameters=True)]
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
@@ -60,8 +60,8 @@ def native_trainer(kind, mode, strategy, interval_mode):
     )
     args = TDMTrainingArguments(
         num_inference_steps=4,
-        tdm_timestep_sampling=strategy,
-        tdm_interval_mode=interval_mode,
+        tdm_query_distribution=distribution,
+        tdm_query_interval=query_interval,
         per_device_batch_size=1,
         gradient_accumulation_steps=8,
         ttur_fake_updates=2,
@@ -169,6 +169,7 @@ def native_trainer(kind, mode, strategy, interval_mode):
     )
     trainer.log_args = SimpleNamespace(verbose=False)
     trainer.step = trainer.epoch = 0
+    trainer._tdm_generation_provenance = {}
     trainer._initialize_snapshots()
     return trainer
 
@@ -213,9 +214,8 @@ def rollout(trainer, kind):
             x = result.next_latents_mean
             states.append(x[0])
     fields = {name: value if name == "img_ids" else value[0] for name, value in batch.items()}
-    return sample_cls(
+    sample = sample_cls(
         **fields,
-        extra_kwargs={"_tdm_sampling_shift": shifts[0]},
         trajectory=StructuredTrajectory(
             components={
                 "latent": ComponentTrajectory(
@@ -227,15 +227,19 @@ def rollout(trainer, kind):
             }
         ),
     )
+    trainer._record_tdm_generation_provenance([sample], shifts[0])
+    return sample
 
 
 @pytest.mark.parametrize("kind", ["sd3", "flux"])
 @pytest.mark.parametrize("mode", ["full", "lora"])
-@pytest.mark.parametrize("strategy", ["truncated_logit_normal", "pre_shift_uniform"])
-@pytest.mark.parametrize("interval_mode", ["reverse", "disjoint"])
-def test_native_tdm_sampling_complete_cycles(kind, mode, strategy, interval_mode):
+@pytest.mark.parametrize(
+    "distribution", ["actual_uniform", "conditional_logit_normal", "source_uniform"]
+)
+@pytest.mark.parametrize("query_interval", ["reverse", "trajectory"])
+def test_native_tdm_sampling_complete_cycles(kind, mode, distribution, query_interval):
     torch.manual_seed(73)
-    trainer = native_trainer(kind, mode, strategy, interval_mode)
+    trainer = native_trainer(kind, mode, distribution, query_interval)
     registry = trainer.adapter.component_variant_registry
     initial = {
         name: [p.detach().clone() for p in registry.parameters(name)]

@@ -27,7 +27,7 @@ from ...contracts.execution import (
     ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
     ExecutionContract,
 )
-from ...hparams import Arguments, TDMTrainingArguments
+from ...hparams import Arguments, TDMQuerySamplingPolicy, TDMTrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
 from ...models.trajectory_bridge import resolve_replay_projection_times
@@ -65,7 +65,7 @@ from .distribution_matching import (
     tdm_generator_loss,
 )
 from .dmd2 import DMD2Trainer
-from .tdm_time_sampling import capture_generation_shift
+from .tdm_time_sampling import TDMGenerationProvenance, capture_generation_shift
 from .tdm_trajectory import TDMBoundaryUnit, TDMTrajectoryRuntimeMixin
 
 
@@ -90,24 +90,33 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
     execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     def runtime_execution_identity_payload(self) -> Dict[str, Any]:
-        """Lock the sampling contract and effective static shifts for exact resume.
+        """Lock only active query semantics and effective static shifts for exact resume.
 
         Returns:
             Default identity plus TDM sampling semantics. Dynamic shift configuration
             and input geometry are already locked by the shared execution/data schema.
         """
         payload = build_default_execution_identity_payload(self)
-        payload["tdm_time_sampling"] = {
-            "version": 1,
-            "static_shifts": {
+        policy = TDMQuerySamplingPolicy.from_training_args(self.training_args)
+        for field_name in (
+            "tdm_query_interval",
+            "tdm_query_distribution",
+            "tdm_query_max_sigma",
+            "tdm_query_logit_mean",
+            "tdm_query_logit_std",
+        ):
+            payload["training"].pop(field_name, None)
+        query_identity = policy.resume_identity()
+        if policy.requires_generation_shift:
+            query_identity["static_shifts"] = {
                 name: (
                     None
                     if getattr(scheduler, "config", {}).get("use_dynamic_shifting", False)
                     else getattr(scheduler, "shift", None)
                 )
                 for name, scheduler in self.adapter.scheduler_group.items()
-            },
-        }
+            }
+        payload["tdm_query_sampling"] = query_identity
         return payload
 
     def sample_batch(
@@ -121,16 +130,42 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
             **kwargs: Generation options forwarded to the shared sampling pipeline.
 
         Returns:
-            Samples carrying the effective primary shift for pre-shift uniform replay.
+            Samples whose rollout-only provenance is registered before reward submission.
         """
-        if self.training_args.tdm_timestep_sampling != "pre_shift_uniform":
+        policy = TDMQuerySamplingPolicy.from_training_args(self.training_args)
+        if not policy.requires_generation_shift:
             return super().sample_batch(batch, reward_buffer=reward_buffer, **kwargs)
         primary = self.adapter.trajectory_component_order[0]
         with capture_generation_shift(self.adapter.scheduler_group[primary]) as shifts:
-            samples = super().sample_batch(batch, reward_buffer=reward_buffer, **kwargs)
-        for sample in samples:
-            sample.extra_kwargs["_tdm_sampling_shift"] = shifts[0]
+            samples = super().sample_batch(batch, reward_buffer=None, **kwargs)
+        self._record_tdm_generation_provenance(samples, shifts[0])
+        if reward_buffer is not None:
+            reward_buffer.add_samples(samples)
         return samples
+
+    def _record_tdm_generation_provenance(
+        self,
+        samples: Sequence[BaseSample],
+        source_shift: float,
+    ) -> None:
+        """Register one rollout's private source-coordinate provenance."""
+        provenance = TDMGenerationProvenance(source_shift=source_shift)
+        for sample in samples:
+            self._tdm_generation_provenance[id(sample)] = provenance
+
+    def _tdm_generation_provenance_for(self, sample: BaseSample) -> TDMGenerationProvenance:
+        """Return private rollout provenance for one unchanged local sample object."""
+        provenance = self._tdm_generation_provenance.get(id(sample))
+        if provenance is None:
+            raise ValueError(
+                "source_uniform requires rollout-owned generation provenance; collect "
+                "trajectories through TDM.sample_batch() before replay"
+            )
+        return provenance
+
+    def _clear_tdm_generation_provenance(self) -> None:
+        """Drop rollout-private provenance at an acquisition-cycle boundary."""
+        self._tdm_generation_provenance = {}
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM's published defaults.
@@ -161,6 +196,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         self.training_args: TDMTrainingArguments
         self._rollout_data_iter: Iterator[Any] | None = None
         self._rollout_batches_consumed: int | None = None
+        self._tdm_generation_provenance: Dict[int, TDMGenerationProvenance] = {}
         self._validate_trajectory_configuration()
 
     def _init_reward_model(self) -> Tuple[Dict[str, object], Dict[str, object]]:
@@ -182,7 +218,11 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         eval-time reward monitoring behave exactly as they do for every other
         trainer.
         """
-        run_distillation_training_step(self)
+        self._clear_tdm_generation_provenance()
+        try:
+            run_distillation_training_step(self)
+        finally:
+            self._clear_tdm_generation_provenance()
 
     def sample(self) -> List[BaseSample]:
         """Collect the initial state and every generated ODE boundary."""
@@ -423,9 +463,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         """Move and stack one boundary unit without generated media."""
         if not replay_samples:
             raise ValueError("expected a non-empty TDM boundary unit, received no samples")
-        batch = BaseSample.stack([sample.to(self.accelerator.device) for sample in replay_samples])
-        batch.pop("_tdm_sampling_shift", None)
-        return batch
+        return BaseSample.stack([sample.to(self.accelerator.device) for sample in replay_samples])
 
     def _replay_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
         """Return allow-listed adapter arguments not already owned by the batch."""

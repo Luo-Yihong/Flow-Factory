@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import torch
 
+from ...hparams.training_args.tdm import TDMQuerySamplingPolicy
 from ...samples import (
     BaseSample,
     ComponentTimes,
@@ -28,7 +29,7 @@ from ...samples import (
     StructuredTrajectory,
 )
 from ...utils.noise_schedule import TIMESTEP_MAX, flow_match_sigma, validate_flow_match_coordinates
-from .tdm_time_sampling import sample_interval_sigma
+from .tdm_time_sampling import RationalFlowShift, sample_query_timestep
 
 _SCORE_QUERY_SAMPLE_ATTEMPTS = 8
 
@@ -38,16 +39,38 @@ class _TDMCoordinateContainmentError(ValueError):
 
 
 @dataclass(frozen=True)
+class TDMQueryBounds:
+    """Store explicit component-wise lower and upper query coordinates."""
+
+    lower: ComponentTimes
+    upper: ComponentTimes
+
+
+@dataclass(frozen=True)
+class TDMQueryBatchContext:
+    """Share immutable query policy and coordinate transforms across K boundaries."""
+
+    policy: TDMQuerySamplingPolicy
+    primary_name: str
+    source_transform: RationalFlowShift | None
+    reverse_upper_times: ComponentTimes | None
+
+
+@dataclass(frozen=True)
 class TDMBoundaryUnit:
-    """Store one replay batch, its exact lower boundary, and perturbation interval."""
+    """Store one replay batch and one boundary's explicit score-query bounds."""
 
     samples: tuple[BaseSample, ...]
     boundary_index: int
-    primary_name: str
     times: ComponentTimes
     mid_times: ComponentTimes
-    sampling_shift: torch.Tensor | None = None
-    query_upper_times: ComponentTimes | None = None
+    query_context: TDMQueryBatchContext
+    query_bounds: TDMQueryBounds
+
+    @property
+    def primary_name(self) -> str:
+        """Return the primary component shared by this replay microbatch."""
+        return self.query_context.primary_name
 
     @property
     def interval_start(self) -> torch.Tensor:
@@ -72,10 +95,9 @@ class TDMBoundaryUnit:
         """Return the upper timestep of the selected loss sampling interval.
 
         Returns:
-            Mapped t_max for reverse, or the stored upper boundary for disjoint.
+            Mapped maximum for reverse, or the stored upper boundary for trajectory.
         """
-        times = self.times if self.query_upper_times is None else self.query_upper_times
-        return times.timestep[self.primary_name]
+        return self.query_bounds.upper.timestep[self.primary_name]
 
 
 class TDMTrajectoryRuntimeMixin:
@@ -115,17 +137,16 @@ class TDMTrajectoryRuntimeMixin:
                 f"received samples={len(samples)} and per_device_batch_size={batch_size}"
             )
 
-        units: list[TDMBoundaryUnit] = []
         replay_samples = tuple(samples)
         batch = self._stack_replay_unit(replay_samples)
         self._validate_sample_boundaries(replay_samples, batch)
+        boundaries: list[tuple[int, ComponentTimes, ComponentTimes]] = []
         previous_times: ComponentTimes | None = None
         for boundary_index in range(1, self.training_args.num_inference_steps + 1):
             replay_step = self.adapter.get_replay_step(
                 batch,
                 boundary_index - 1,
             )
-            primary_name = self.adapter.trajectory_component_order[0]
             times = TDMTrajectoryRuntimeMixin._normalize_replay_times(
                 self,
                 replay_step.times,
@@ -138,78 +159,121 @@ class TDMTrajectoryRuntimeMixin:
                 previous_times=previous_times,
             )
             stored_times = TDMTrajectoryRuntimeMixin._clone_component_times(times)
-            query_upper_times = self._build_query_upper_times(
-                batch, stored_times, mid_times, boundary_index=boundary_index
+            boundaries.append((boundary_index, stored_times, mid_times))
+            previous_times = stored_times
+
+        context = self._build_query_batch_context(
+            replay_samples,
+            batch,
+            template_times=boundaries[0][1],
+        )
+        units: list[TDMBoundaryUnit] = []
+        for boundary_index, stored_times, mid_times in boundaries:
+            query_bounds = self._build_query_bounds(
+                context,
+                stored_times,
+                mid_times,
+                boundary_index=boundary_index,
             )
-            sampling_shift = None
-            if self.training_args.tdm_timestep_sampling == "pre_shift_uniform":
-                if any("_tdm_sampling_shift" not in sample.extra_kwargs for sample in samples):
-                    raise ValueError(
-                        "pre_shift_uniform requires per-sample generation shift metadata; "
-                        "collect trajectories through TDM.sample_batch()"
-                    )
-                sampling_shift = torch.tensor(
-                    [sample.extra_kwargs["_tdm_sampling_shift"] for sample in samples],
-                    device=stored_times.timestep[primary_name].device,
-                    dtype=torch.float64,
-                )
             units.append(
                 TDMBoundaryUnit(
                     samples=replay_samples,
                     boundary_index=boundary_index,
-                    primary_name=primary_name,
                     times=stored_times,
                     mid_times=mid_times,
-                    sampling_shift=sampling_shift,
-                    query_upper_times=query_upper_times,
+                    query_context=context,
+                    query_bounds=query_bounds,
                 )
             )
-            previous_times = stored_times
         return units
 
-    def _build_query_upper_times(
+    def _build_query_batch_context(
         self,
+        samples: tuple[BaseSample, ...],
         batch: StackedSampleBatch,
+        template_times: ComponentTimes,
+    ) -> TDMQueryBatchContext:
+        """Build one query policy context shared by every boundary in a microbatch."""
+        policy = TDMQuerySamplingPolicy.from_training_args(self.training_args)
+        primary = self.adapter.trajectory_component_order[0]
+        source_transform = None
+        if policy.requires_generation_shift:
+            shifts = torch.tensor(
+                [self._tdm_generation_provenance_for(sample).source_shift for sample in samples],
+                device=template_times.timestep[primary].device,
+                dtype=torch.float64,
+            )
+            source_transform = RationalFlowShift(shifts)
+        reverse_upper_times = None
+        if policy.interval == "reverse":
+            upper = torch.full_like(
+                template_times.timestep[primary],
+                policy.max_sigma * TIMESTEP_MAX,
+            )
+            mapped = self.adapter.build_training_component_times(upper, batch=batch)
+            order = self.adapter.trajectory_component_order
+            if (
+                mapped.sigma is None
+                or tuple(mapped.timestep) != order
+                or tuple(mapped.sigma) != order
+            ):
+                raise ValueError(
+                    "TDM reverse upper-bound mapping requires ordered component times and sigmas"
+                )
+            for name in order:
+                validate_flow_match_coordinates(
+                    mapped.timestep[name],
+                    mapped.sigma[name],
+                    identifier=f"TDM reverse upper bound component={name!r}",
+                )
+            reverse_upper_times = self._clone_component_times(mapped)
+        return TDMQueryBatchContext(
+            policy=policy,
+            primary_name=primary,
+            source_transform=source_transform,
+            reverse_upper_times=reverse_upper_times,
+        )
+
+    def _build_query_bounds(
+        self,
+        context: TDMQueryBatchContext,
         stored_times: ComponentTimes,
         mid_times: ComponentTimes,
         *,
         boundary_index: int,
-    ) -> ComponentTimes | None:
-        """Map reverse's upper bound without changing authoritative replay endpoints."""
-        if self.training_args.tdm_interval_mode == "disjoint":
-            return None
-        primary = self.adapter.trajectory_component_order[0]
-        lower, _ = self._normalize_coordinates(
-            stored_times.next_timestep[primary], stored_times.timestep[primary]
+    ) -> TDMQueryBounds:
+        """Resolve and validate explicit component bounds for one trajectory boundary."""
+        upper_times = (
+            stored_times if context.policy.interval == "trajectory" else context.reverse_upper_times
         )
-        upper = torch.full_like(lower, self.training_args.tdm_t_max * TIMESTEP_MAX)
+        if upper_times is None:
+            raise RuntimeError("TDM reverse query context has no mapped upper coordinates")
+        primary = context.primary_name
+        lower, upper = self._normalize_coordinates(
+            mid_times.timestep[primary], upper_times.timestep[primary]
+        )
         if not bool((lower < upper).all()):
             raise ValueError(
-                "TDM reverse interval requires train.tdm_t_max above every lower boundary; "
-                f"tdm_t_max={self.training_args.tdm_t_max}, boundary_index={boundary_index}, "
+                "TDM query interval requires its upper sigma above every lower boundary; "
+                f"tdm_query_interval={context.policy.interval!r}, "
+                f"tdm_query_max_sigma={context.policy.max_sigma}, "
+                f"boundary_index={boundary_index}, "
                 f"lower_sigma={flow_match_sigma(lower).tolist()}"
             )
-        mapped = self.adapter.build_training_component_times(upper, batch=batch)
-        order = self.adapter.trajectory_component_order
-        if mapped.sigma is None or tuple(mapped.timestep) != order or tuple(mapped.sigma) != order:
-            raise ValueError(
-                "TDM reverse upper-bound mapping requires ordered component times and sigmas"
-            )
-        for name in order:
-            validate_flow_match_coordinates(
-                mapped.timestep[name],
-                mapped.sigma[name],
-                identifier=f"TDM reverse upper bound component={name!r}, boundary_index={boundary_index}",
-            )
+        for name in self.adapter.trajectory_component_order:
             for field in ("timestep", "sigma"):
+                upper_mapping = getattr(upper_times, field)
+                lower_mapping = getattr(mid_times, field)
+                if upper_mapping is None or lower_mapping is None:
+                    continue
                 self._validate_descending_coordinate_pair(
-                    getattr(mapped, field)[name],
-                    getattr(mid_times, field)[name],
-                    field=f"reverse {field}",
+                    upper_mapping[name],
+                    lower_mapping[name],
+                    field=f"query {field}",
                     component=name,
                     boundary_index=boundary_index,
                 )
-        return self._clone_component_times(mapped)
+        return TDMQueryBounds(lower=mid_times, upper=upper_times)
 
     def _normalize_replay_times(
         self,
@@ -587,15 +651,12 @@ class TDMTrajectoryRuntimeMixin:
                 f"floating interior between start={unit.interval_start.tolist()} and "
                 f"end={unit.query_interval_end.tolist()}"
             )
-        sigma = sample_interval_sigma(
-            flow_match_sigma(interval_start.double()),
-            flow_match_sigma(interval_end.double()),
-            strategy=self.training_args.tdm_timestep_sampling,
-            logit_mean=self.training_args.tdm_logit_mean,
-            logit_std=self.training_args.tdm_logit_std,
-            shift=unit.sampling_shift,
+        sampled = sample_query_timestep(
+            interval_start,
+            interval_end,
+            policy=unit.query_context.policy,
+            source_transform=unit.query_context.source_transform,
         )
-        sampled = (sigma * TIMESTEP_MAX).to(interval_start.dtype)
         return torch.minimum(torch.maximum(sampled, open_start), open_end)
 
     def _sample_score_query_times(
@@ -637,7 +698,8 @@ class TDMTrajectoryRuntimeMixin:
         """Require every component coordinate inside the selected loss interval."""
         boundary_index = unit.boundary_index
         component_order = self.adapter.trajectory_component_order
-        upper_times = unit.times if unit.query_upper_times is None else unit.query_upper_times
+        lower_times = unit.query_bounds.lower
+        upper_times = unit.query_bounds.upper
         if times.sigma is None:
             raise ValueError(
                 "TDM score-query sigma validation expected component sigmas; "
@@ -664,7 +726,7 @@ class TDMTrajectoryRuntimeMixin:
             )
             self._validate_contained_coordinate(
                 timestep,
-                lower=unit.times.next_timestep[name],
+                lower=lower_times.timestep[name],
                 upper=upper_times.timestep[name],
                 field="timestep",
                 component=name,
@@ -673,14 +735,14 @@ class TDMTrajectoryRuntimeMixin:
             if upper_times.sigma is not None:
                 self._validate_contained_coordinate(
                     sigma,
-                    lower=unit.mid_times.sigma[name],
+                    lower=lower_times.sigma[name],
                     upper=upper_times.sigma[name],
                     field="sigma",
                     component=name,
                     boundary_index=boundary_index,
                 )
             else:
-                lower_sigma = unit.mid_times.sigma[name]
+                lower_sigma = lower_times.sigma[name]
                 normalized_sigma, normalized_lower = self._normalize_coordinates(
                     sigma,
                     lower_sigma,

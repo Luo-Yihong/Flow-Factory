@@ -57,11 +57,11 @@ log:
 
 train:
   trainer_type: "tdm"
-  tdm_interval_mode: reverse  # Options: reverse, disjoint
-  tdm_t_max: 0.98  # Post-shift sigma upper bound; only used by reverse
-  tdm_timestep_sampling: truncated_logit_normal  # Options: truncated_logit_normal, pre_shift_uniform
-  tdm_logit_mean: 0.0  # Normal mean in actual sigma logit space
-  tdm_logit_std: 1.0  # Positive normal std; pre_shift_uniform reuses the generation shift
+  tdm_query_interval: reverse  # Options: trajectory, reverse
+  tdm_query_max_sigma: 1.0  # Required by the shift-12 six-step schedule
+  tdm_query_distribution: conditional_logit_normal  # Options: actual_uniform, conditional_logit_normal, source_uniform
+  tdm_query_logit_mean: 0.0  # Active only for conditional_logit_normal
+  tdm_query_logit_std: 1.0  # Active only for conditional_logit_normal
   max_epochs: 10000
   resolution: [512, 768]
   num_frames: 124
